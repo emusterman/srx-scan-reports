@@ -72,7 +72,8 @@ def _find_xrf_rois(xrf,
                    energy_tolerance=50,
                    esc_en=1740,
                    snr_cutoff=100,
-                   scan_kwargs={}):
+                   scan_kwargs={},
+                   verbose=False):
 
         # Parse out scan_kwargs
         if 'specific_elements' in scan_kwargs:
@@ -89,6 +90,13 @@ def _find_xrf_rois(xrf,
             esc_en = scan_kwargs.pop('esc_en')
         if 'snr_cutoff' in scan_kwargs:
             snr_cutoff = scan_kwargs['snr_cutoff']
+        
+        # Verbosity
+        if verbose:
+            print('Finding XRF ROI information.')
+            print(f'{min_roi_num=}')
+            print(f'{max_roi_num=}')
+            print(f'{specific_elements=}')
 
         # Parse some inputs
         if min_roi_num > max_roi_num:
@@ -111,11 +119,6 @@ def _find_xrf_rois(xrf,
                     # print(f'{el} added to found elements')
                     found_elements.append(xrfC.XrfElement(el))
                     num_interesting_rois += 1
-        
-        # print(found_elements)
-
-        # Do not modify the original data
-        xrf = xrf.copy()
 
         # Convert energy to eV
         if energy[int((len(energy) - 1) / 2)] < 1e3:
@@ -126,151 +129,185 @@ def _find_xrf_rois(xrf,
         # Get energy step size
         en_step = np.mean(np.diff(energy), dtype=int)
 
-        # Crop XRF and energy to reasonable limits (Assuming 10 eV steps)
-        # No peaks below 1000 eV or above 85% of incident energy
-        en_range = slice(int(1e3 / en_step), int(0.9 * incident_energy / en_step))
-        xrf = xrf[en_range]
-        energy = energy[en_range]
+        # Only try to find rois if the max_roi_num is not satisfied by specific_elements inputs
+        if num_interesting_rois < max_roi_num:
+            # Do not modify the original data
+            xrf = xrf.copy()
 
-        # Remove invalid data_points (mostly zeros)
-        xrf[xrf < 1] = 1
+            # Crop XRF and energy to reasonable limits (Assuming 10 eV steps)
+            # No peaks below 1000 eV or above 85% of incident energy
+            en_range = slice(int(1e3 / en_step), int(0.9 * incident_energy / en_step))
+            xrf = xrf[en_range]
+            energy = energy[en_range]
 
-        # Estimate background and noise
-        bkg = mode(xrf)[0] * (200 / en_step)
-        noise = np.sqrt(bkg)
+            # Remove invalid data_points (mostly zeros)
+            xrf[xrf < 1] = 1
 
-        # Find peaks based on log prominence
-        peaks, proms = find_peaks(np.log(xrf), prominence=log_prominence)
+            # Estimate background and noise
+            bkg = mode(xrf)[0] * (200 / en_step)
+            noise = np.sqrt(bkg)
 
-        # Blindly find intensity from 200 eV window (assuming 10 eV steps)
-        peak_snr = [(np.sum(xrf[peak - int(100 / en_step) : peak + int(100 / en_step)]) - bkg) / noise for peak in peaks]
+            # Find peaks based on log prominence
+            peaks, proms = find_peaks(np.log(xrf), prominence=log_prominence)
 
-        # Sort the peaks by snr
-        sorted_peaks = [x for y, x in sorted(zip(peak_snr, peaks), key=lambda pair: pair[0], reverse=True)]
-        sorted_snr = sorted(peak_snr, reverse=True)
+            # Blindly find intensity from 200 eV window (assuming 10 eV steps)
+            peak_snr = [(np.sum(xrf[peak - int(100 / en_step) : peak + int(100 / en_step)]) - bkg) / noise for peak in peaks]
 
-        # Convert peaks to energies
-        peak_energies = [energy[peak] for peak in sorted_peaks]
+            # Sort the peaks by snr
+            sorted_peaks = [x for y, x in sorted(zip(peak_snr, peaks), key=lambda pair: pair[0], reverse=True)]
+            sorted_snr = sorted(peak_snr, reverse=True)
 
+            # Convert peaks to energies
+            peak_energies = [energy[peak] for peak in sorted_peaks]
 
-        # Identify peaks
-        peak_labels = []
-        for peak_ind, peak_en in enumerate(peak_energies):
-            
-            # Conditions to stop processing
-            if (num_interesting_rois == max_roi_num # reached max roi count
-                or (sorted_snr[peak_ind] < snr_cutoff # peak snr is now below cutoff
-                    and num_interesting_rois >= min_roi_num)): # and enough rois have been identified
-                break
+            # Identify peaks
+            peak_labels = []
+            for peak_ind, peak_en in enumerate(peak_energies):
+                
+                # Conditions to stop processing
+                if (num_interesting_rois == max_roi_num # reached max roi count
+                    or (sorted_snr[peak_ind] < snr_cutoff # peak snr is now below cutoff
+                        and num_interesting_rois >= min_roi_num)): # and enough rois have been identified
+                    break
 
-            PEAK_FOUND = False
-            # First, check if peak can be explained by an already identified element
-            for el in found_elements:
-                if isinstance(el, int): # Unknown peak...
-                    continue
-
-                for line in lines:
-                    line_en = el.emission_line[line] * 1e3
-                    # Direct peak
-                    if np.abs(peak_en - line_en) < energy_tolerance:
-                        PEAK_FOUND = True
-                        peak_labels.append(f'{el.sym}_{line}')
-                        break
-                else:
-                    continue
-                break
-            
-            # Second, check if peak is artifact of already identified peaks
-            # Check escape peaks first
-            if not PEAK_FOUND:
-                for found_peak_en, found_peak_label in zip(peak_energies[:peak_ind], peak_labels):
-                    # Ignore escape peaks of other artifacts
-                    if found_peak_label.split('_')[-1] in ['escape', 'sum', 'double']:
+                PEAK_FOUND = False
+                # First, check if peak can be explained by an already identified element
+                for el in found_elements:
+                    if isinstance(el, int): # Unknown peak...
                         continue
 
-                    if np.abs(peak_en - (found_peak_en - esc_en)) < energy_tolerance * 2: # double for error propagation
-                        PEAK_FOUND = True
-                        peak_labels.append(f'{found_peak_label}_escape')
-                        break
-            
-            # Now check if it is a pile-up or sum peak
-            if not PEAK_FOUND:
-                for comb_ind in combinations_with_replacement(range(peak_ind), r=2): # not considering combinations above two peaks
-                    sum_en = sum([peak_energies[ind] for ind in comb_ind])
-
-                    # Kick out any combinations of other artifacts
-                    if any([peak_labels[ind].split('_')[-1] in ['escape', 'sum', 'double'] for ind in comb_ind]):
-                        continue
-                    
-                    if comb_ind[0] != comb_ind[1]:
-                        comb_label = f'{peak_labels[comb_ind[0]]}_{peak_labels[comb_ind[1]]}_sum'
-                    else:
-                        comb_label = f'{peak_labels[comb_ind[0]]}_double'
-                    
-                    if np.abs(peak_en - sum_en) < energy_tolerance * 2: # double for error propagation
-                        PEAK_FOUND = True
-                        peak_labels.append(comb_label)
-                        break
-
-            # Otherwise check other elements based on strongest fluorescence
-            if not PEAK_FOUND:
-                for line in major_lines: # Major lines should always be present if elements exists
-                    for el in elements:
+                    for line in lines:
                         line_en = el.emission_line[line] * 1e3
+                        # Direct peak
                         if np.abs(peak_en - line_en) < energy_tolerance:
                             PEAK_FOUND = True
-                            found_elements.append(el)
                             peak_labels.append(f'{el.sym}_{line}')
-                            if el.sym not in boring_elements:
-                                num_interesting_rois += 1
                             break
                     else:
                         continue
                     break
-                else: # Very unlikely
-                    found_elements.append(int(peak_en))
-                    peak_labels.append('Unknown')
-                    num_interesting_rois += 1
+                
+                # Second, check if peak is artifact of already identified peaks
+                # Check escape peaks first
+                if not PEAK_FOUND:
+                    for found_peak_en, found_peak_label in zip(peak_energies[:peak_ind], peak_labels):
+                        # Ignore escape peaks of other artifacts
+                        if found_peak_label.split('_')[-1] in ['escape', 'sum', 'double']:
+                            continue
+
+                        if np.abs(peak_en - (found_peak_en - esc_en)) < energy_tolerance * 2: # double for error propagation
+                            PEAK_FOUND = True
+                            peak_labels.append(f'{found_peak_label}_escape')
+                            break
+                
+                # Now check if it is a pile-up or sum peak
+                if not PEAK_FOUND:
+                    for comb_ind in combinations_with_replacement(range(peak_ind), r=2): # not considering combinations above two peaks
+                        sum_en = sum([peak_energies[ind] for ind in comb_ind])
+
+                        # Kick out any combinations of other artifacts
+                        if any([peak_labels[ind].split('_')[-1] in ['escape', 'sum', 'double'] for ind in comb_ind]):
+                            continue
+                        
+                        if comb_ind[0] != comb_ind[1]:
+                            comb_label = f'{peak_labels[comb_ind[0]]}_{peak_labels[comb_ind[1]]}_sum'
+                        else:
+                            comb_label = f'{peak_labels[comb_ind[0]]}_double'
+                        
+                        if np.abs(peak_en - sum_en) < energy_tolerance * 2: # double for error propagation
+                            PEAK_FOUND = True
+                            peak_labels.append(comb_label)
+                            break
+
+                # Otherwise check other elements based on strongest fluorescence
+                if not PEAK_FOUND:
+                    for line in major_lines: # Major lines should always be present if elements exists
+                        for el in elements:
+                            line_en = el.emission_line[line] * 1e3
+                            if np.abs(peak_en - line_en) < energy_tolerance:
+                                PEAK_FOUND = True
+                                found_elements.append(el)
+                                peak_labels.append(f'{el.sym}_{line}')
+                                if el.sym not in boring_elements:
+                                    num_interesting_rois += 1
+                                break
+                        else:
+                            continue
+                        break
+                    else: # Unlikely
+                        found_elements.append(int(peak_en))
+                        peak_labels.append('Unknown')
+                        num_interesting_rois += 1
 
         # Generate new ROIS
         rois, rois_labels = [], []
         for el in found_elements:
-            # print(f'Found {el.name}!')
             if isinstance(el, int):
+                if verbose:
+                    print(f'Found unknown ROI around {el} eV.')
                 rois.append(slice(int((el / en_step) - (100 / en_step)), int((el / en_step) + (100 / en_step))))
                 rois_labels.append('Unknown')
                 continue
             
             # Ignore argon mostly
             elif el.sym in boring_elements:
+                if verbose:
+                    print(f'Found element {el.sym}, but it is too boring to generate ROI!') 
                 continue
 
+            if verbose:
+                print(f'Found element {el.sym}! Generating ROI around highest yield fluorescence line.')    
             # Slice major lines
             for line in roi_lines:
                 line_en = el.emission_line[line] * 1e3
                 if 1e3 < line_en < incident_energy:
+                    if verbose:
+                        print(f'Highest yield fluorescence line for {el.sym} is {line}.')
                     rois.append(slice(int((line_en / en_step) - (100 / en_step)), int((line_en / en_step) + (100 / en_step))))
                     rois_labels.append(f'{el.sym}_{line}')
                     break
+            else:
+                if verbose:
+                    print(f'No fluorescence line found for {el.sym} with an incident energy of {incident_energy} eV!')
+                    print(f'Cannot generate ROI for {el.sym}!')
 
-        # print(peak_energies)
-        # print(peak_labels)
-
-        return rois, rois_labels, peak_energies, peak_labels, # sorted_snr
+        return rois, rois_labels
 
 
 class SRXScanPDF(FPDF):
 
-    def __init__(self, font_style='helvetica'):
-         FPDF.__init__(self)
-         self.set_auto_page_break(False)
-         self.set_font(font_style)
+    def __init__(self, font_style='helvetica', verbose=False):
+        FPDF.__init__(self)
+        self.set_auto_page_break(False)
+        self.set_font(font_style)
 
-         # Custom
-         self.exp_md = {}         
-         self._disable_header = False
-         self._disable_footer = False
-         self._appended_pages = 0  
+        # Custom
+        self.exp_md = {}         
+        self._disable_header = False
+        self._disable_footer = False
+        self._appended_pages = 0
+        self._verbose = verbose
+
+        # Formatting Variables
+        # Spacing in mm
+        # Heights
+        self._gap_height = 1.5 # Extra space added for gaps
+        self._banner_height = 12.5 # For banner information
+        self._max_height = 55 # General cell height for tables and figures
+        self._offset_height = 1 # Gap between header and table and between figures
+        # General widths
+        # self._gap_width = 1.5 # Unused currently as 1.5, 2.5, and 1 are all used
+
+        # Fonts
+        self._banner_font_size = 9.5
+        self._table_header_font_size = 9
+        self._table_font_size = 8
+        
+        # Table formatting
+        # CAUTION: these values are related to the above spacing variables
+        self._banner_table_cell_height = 4.75
+        self._table_header_height = 4
+        self._table_cell_height = 3.9
 
 
     def header(self):
@@ -296,7 +333,7 @@ class SRXScanPDF(FPDF):
             title_words = self.exp_md['title'].split(' ')
             title_text = title_words[0]
             for word in title_words[1:]:
-                if len(title_text) + len(word) + 4 < 80:
+                if len(title_text) + len(word) + 4 < 85:
                     title_text += f' {word}'
                 else:
                     title_text += '...'
@@ -305,6 +342,7 @@ class SRXScanPDF(FPDF):
 
         self.set_line_width(0.5)
         self.set_draw_color(0, 0, 0)
+        # Hard-coded gap of 1.5 mm. May be worth assigning to self._gap
         self.line(x1=self.l_margin, y1=self.y + 1.5, x2=self.epw + self.l_margin, y2=self.y + 1.5)
 
         post_header_abscissa = (self.x, self.y)
@@ -366,8 +404,21 @@ class SRXScanPDF(FPDF):
         super().add_page(*args, **kwargs)
         self.disable_header = True
         self.disable_footer = True
-
     
+
+    def request_cell_space(self,
+                           space_needed):
+        
+        space_available = self.eph - self.y - self.b_margin
+        
+        if self._verbose:
+            print(f'Space needed for cell: {space_needed}')
+            print(f'Space available: {space_available}')
+
+        if space_available < space_needed:
+            self.add_page()
+        
+
     def add_scan(self,
                  scan_id,
                  include_optimizers=True,
@@ -406,34 +457,62 @@ class SRXScanPDF(FPDF):
             start_y = self.y
             self.add_XRF_FLY(bs_run, scan_data, scan_kwargs)
             end_y = self.y
-            # print(f'Cell took {end_y - start_y} mm.')
+            if self._verbose:
+                print(f'Cell took {end_y - start_y} mm.')
+
         elif scan_data['scan_type'] == 'XAS_STEP':
+            start_y = self.y
             self.add_XAS_STEP(bs_run, scan_data, scan_kwargs)
+            end_y = self.y
+            if self._verbose:
+                print(f'Cell took {end_y - start_y} mm.')
+
         elif scan_data['scan_type'] == 'XAS_FLY':
-            self.add_XAS_FLY(bs_run, scan_data, scan_kwargs)            
+            start_y = self.y
+            self.add_XAS_FLY(bs_run, scan_data, scan_kwargs)
+            end_y = self.y
+            if self._verbose:
+                print(f'Cell took {end_y - start_y} mm.')
+
         # elif scan_data['scan_type'] == 'XRF_STEP':
         #     self.add_XRF_STEP(bs_run, scan_data, scan_kwargs)
+
         elif scan_data['scan_type'] == 'ANGLE_RC':
+            start_y = self.y
             self.add_ANGLE_RC(bs_run, scan_data, scan_kwargs)
+            end_y = self.y
+            if self._verbose:
+                print(f'Cell took {end_y - start_y} mm.')
+
         elif scan_data['scan_type'] == 'ENERGY_RC':
+            start_y = self.y
             self.add_ENERGY_RC(bs_run, scan_data, scan_kwargs)
+            end_y = self.y
+            if self._verbose:
+                print(f'Cell took {end_y - start_y} mm.')
+
         elif scan_data['scan_type'] in ['PEAKUP', 'OPTIMIZE_SCALERS']:
             if include_optimizers:
-                if self.h - self.y - self.b_margin < 15 + 1:
-                    self.add_page()
+                start_y = self.y
+                self.request_cell_space(self._banner_height + self._gap_height)
                 self.add_BASE_SCAN(scan_data, scan_kwargs, add_space=True)
+                end_y = self.y
+                if self._verbose:
+                    print(f'Cell took {end_y - start_y} mm.')
             else:
                 return
+
         elif include_unknowns:
             warn_str = (f"WARNING: Scan {scan_id} of type {scan_data['scan_type']} "
                         + "not yet support for SRX scan reports.")
             print(warn_str)
             start_y = self.y
-            if self.h - self.y - self.b_margin < 86.5:
-                self.add_page()
+            self.request_cell_space(self._banner_height + self._max_height + self._gap_height + self._offset_height)
             self.add_BASE_SCAN(scan_data, scan_kwargs, add_space=True)
             end_y = self.y
-            print(f'Unknown took {end_y - start_y} mm.')
+            if self._verbose:
+                print(f'Unknown took {end_y - start_y} mm.')
+
         else:
             return
     
@@ -465,10 +544,13 @@ class SRXScanPDF(FPDF):
                       add_space=False):
         """Add basic data for all scans"""
 
+        if self._verbose:
+            print('Adding BASE_SCAN...')
+
         # Generate starting line
         self.set_line_width(0.5)
         self.set_draw_color(0, 0, 0)
-        self.set_xy(self.x, self.y + 1.5)
+        self.set_xy(self.x, self.y + self._gap_height)
         self.line(x1=self.l_margin, y1=self.y, x2=self.epw + self.l_margin, y2=self.y)
         if scan_data['stop_time'] is not None:
             stop_time = ttime.strftime('%b %d %H:%M:%S', ttime.localtime(scan_data['stop_time']))
@@ -478,10 +560,10 @@ class SRXScanPDF(FPDF):
             duration = 'unknown'
 
         scan_labels = ['ID', 'Type', 'Status', 'Start', 'Stop', 'Duration']
-        if len(scan_data['scan_type']) <= 10:
+        if len(scan_data['scan_type']) <= 12:
             scan_type_str = scan_data['scan_type']
         else:
-            scan_type_str = f"{scan_data['scan_type'][:10]}..."
+            scan_type_str = f"{scan_data['scan_type'][:12]}..."
         scan_values = [str(scan_data['scan_id']),
                        scan_type_str,
                        scan_data['exit_status'].upper(),
@@ -490,51 +572,68 @@ class SRXScanPDF(FPDF):
                        duration]
         
         # General scan data
-        self.set_xy(self.x, self.y + 1.5)
+        self.set_xy(self.x, self.y + self._gap_height)
         self.set_line_width(0.1)
-        self.set_font(size=10)
+        self.set_font(size=self._banner_font_size)
         with self.table(
                 # borders_layout="NONE",
                 first_row_as_headings=False,
-                line_height=5,
+                line_height=self._banner_table_cell_height,
                 align='L',
                 ) as table:
             row = table.row()
             for i in range(len(scan_labels)):
                 if i == 0:
-                    self.set_font(style='B', size=10)
+                    self.set_font(style='B', size=self._banner_font_size)
                 row.cell(f'{scan_labels[i]}')
                 if i == 0:
-                    self.set_font(style='', size=10)
+                    self.set_font(style='', size=self._banner_font_size)
             row = table.row()
             for i in range(len(scan_labels)):
                 if i == 0:
-                    self.set_font(style='B', size=10)
+                    self.set_font(style='B', size=self._banner_font_size)
                 row.cell(str(scan_values[i]))
                 if i == 0:
-                    self.set_font(size=10)
+                    self.set_font(size=self._banner_font_size)
         
-        # Do not add reference positions for failed scans or peakups?
+        # Do not add reference positions for failed scans or optimizers?
         if (scan_data['scan_type'] in ['PEAKUP', 'OPTIMIZE_SCALERS']):
+            if add_space:
+                self.set_xy(self.l_margin, self.y + self._gap_height)
             return
 
-        ref_labels = ['Energy', 'Coarse X', 'Coarse Y', 'Coarse Z', 'Top X', 'Top Z', 'Theta', 'Scanner X', 'Scanner Y', 'Scanner Z', 'SDD Offset']
+        ref_labels = ['Energy', 'Coarse X', 'Coarse Y', 'Coarse Z', 'Top X', 'Top Z', 'Theta', 'Scanner X', 'Scanner Y', 'Scanner Z', 'SDD X']
         ref_values = [scan_data[key] for key in ['energy', 'x', 'y', 'z', 'topx', 'topz', 'th', 'sx', 'sy', 'sz', 'sdd_x']]
         ref_units = [scan_data[f'{key}_units'] for key in ['energy', 'x', 'y', 'z', 'topx', 'topz', 'th', 'sx', 'sy', 'sz', 'sdd_x']]
         ref_precision = [0, 1, 1, 1, 1, 1, 3, 3, 3, 3, 0]
+
+        # Parse attenuators:
+        atten = {'Al' : 0, 'Si' : 0}
+        for key, val in scan_data.items():
+            if 'attenuators_' in key and val == 1:
+                el, t = key[12:].split('_')
+                atten[el] += float(t[:-2])
+        atten_str = ''
+        for key, val in atten.items():
+            if val > 0:
+                if atten_str != '':
+                    atten_str += '\n'
+                atten_str += f'{val:.0f} um {key}'
+        if atten_str == '':
+            atten_str = 'None'
         
         # Reference data
-        self.set_xy(self.x, self.y + 1)
+        self.set_xy(self.x, self.y + self._offset_height)
         reset_y = self.y
-        self.set_font(style='B', size=10)
-        self.cell(h=5, new_x='LMARGIN', new_y='NEXT', text=f"Reference Data")
-        self.set_font(size=9)
+        self.set_font(style='B', size=self._table_header_font_size)
+        self.cell(h=self._table_header_height, new_x='LMARGIN', new_y='NEXT', text=f"Reference Data")
+        self.set_font(size=self._table_font_size)
         with self.table(
                 # borders_layout="NONE",
                 first_row_as_headings=False,
-                line_height=4.5,
-                col_widths=(20, 20),
-                width=40,
+                line_height=self._table_cell_height,
+                col_widths=(17, 20),
+                width=37,
                 align='L'
                 ) as table:
             for i in range(len(ref_labels)):
@@ -544,10 +643,16 @@ class SRXScanPDF(FPDF):
                     row.cell(f'{np.round(ref_values[i], ref_precision[i]):.{ref_precision[i]}f}' + f' {ref_units[i]}')
                 else:
                     row.cell('-')
+
+            # Add attenuators
+            row = table.row()
+            row.cell('Total\nAttenuation')
+            row.cell(atten_str)
+
             table_width = table._width
         
         if add_space:
-            self.set_xy(self.l_margin, self.y + 1.5 + 1)
+            self.set_xy(self.l_margin, self.y + self._gap_height)
         else:
             self.set_xy(self.x + table_width, reset_y)
 
@@ -561,7 +666,10 @@ class SRXScanPDF(FPDF):
                     ignore_det_rois=[],
                     colornorm='linear'
                     ):
-        """Add data specific to XRF_FLY scans"""        
+        """Add data specific to XRF_FLY scans"""
+
+        if self._verbose:
+            print('Adding XRF_FLY...')    
 
         # Parse other kwargs. This allows for the xrf_fly specific defaults
         if 'min_roi_num' in scan_kwargs:
@@ -584,16 +692,6 @@ class SRXScanPDF(FPDF):
             except MemoryError:
                 # Dask version
                 xrf_sum = da.asarray(bs_run['stream0']['data']['xs_fluor'])[..., :2500].sum(axis=(0, 1, 2)).compute().astype(np.float32)
-
-                # Iterative version. Add each pixel individually. Way too slow
-                # data_array = bs_run['stream0']['data']['xs_fluor']
-                # xrf_sum = np.zeros(data_array.shape[-1])
-                # for index in range(np.prod(data_array.shape[:2])):
-                #     indices = np.unravel_index(index, data_array.shape[:2])
-                #     xrf_sum += data_array[*indices, :, :2500].sum(axis=0)
-                
-            except Exception as e:
-                raise e
             
             # Determine energy. Hard coded for current xpress3
             energy = np.arange(0, len(xrf_sum)) * 10
@@ -618,14 +716,13 @@ class SRXScanPDF(FPDF):
             # May replace with saved ROIS later
             if 'xs' in roi_dets:
                 (rois,
-                rois_labels,
-                peak_energies,
-                peak_labels) = _find_xrf_rois(xrf_sum,
-                                              energy,
-                                              scan_data['energy'],
-                                              min_roi_num=min_roi_num,
-                                              max_roi_num=max_roi_num,
-                                              scan_kwargs=scan_kwargs)
+                 rois_labels) = _find_xrf_rois(xrf_sum,
+                                               energy,
+                                               scan_data['energy'],
+                                               min_roi_num=min_roi_num,
+                                               max_roi_num=max_roi_num,
+                                               scan_kwargs=scan_kwargs,
+                                               verbose=self._verbose)
                 
             else:
                 rois, rois_labels = [], []
@@ -645,28 +742,22 @@ class SRXScanPDF(FPDF):
                 rois_labels.insert(0, 'dexela')
                 dets_added += 1
 
+            # Check for weird results
+            if len(rois) == 0 and min_roi_num > 0:
+                warn_str = ("WARNING: Could not find any interesting and "
+                            + "significant ROIs for scan "
+                            + f"{scan_data['scan_id']}.")
+                print(warn_str)
+        
         else:
             rois = []
 
-        # print(f'{len(rois)=}')
-
-        # Check for weird results
-        if len(rois) == 0 and min_roi_num > 0:
-            warn_str = ("WARNING: Could not find any interesting and "
-                        + "significant ROIs for scan "
-                        + f"{scan_data['scan_id']}.")
-            print(warn_str)
+        print(f'ROIs found for XRF_FLY are {len(rois)}.')
             
         # Determine if a new page needs to be added
-        max_height = 55 # Height of reference data
         num_images = np.min([len(rois), max_roi_num])
-        # 13 for top banner, 1.5 for end, 1 for spacing
-        space_needed = (13 + 1.5 + ((max_height + 1) * np.ceil(1 + (num_images - 1) / 3)))
-        space_available = self.eph - self.y - self.b_margin
-        # print(f'Space needed for cell: {space_needed}')
-        # print(f'Space available: {space_available}')
-        if space_available < space_needed:
-            self.add_page()
+        space_needed = (self._banner_height + self._gap_height + self._offset_height + ((self._max_height + self._offset_height) * np.ceil(1 + (num_images - 1) / 3)))
+        self.request_cell_space(space_needed)
         
         # Add base scan information
         self.add_BASE_SCAN(scan_data, scan_kwargs)
@@ -709,18 +800,18 @@ class SRXScanPDF(FPDF):
         # Scan-specific data
         reset_y = self.y
         self.set_xy(self.x + 2.5, self.y)
-        self.set_font(style='B', size=10)
-        self.cell(h=5, new_x='LEFT', new_y='NEXT', text=f"Scan Data")
-        self.set_font(size=9)
+        self.set_font(style='B', size=self._table_header_font_size)
+        self.cell(h=self._table_header_height, new_x='LEFT', new_y='NEXT', text=f"Scan Data")
+        self.set_font(size=self._table_font_size)
         l_margin = self.l_margin 
         self.l_margin = self.x # Temp move to set table location. Probably bad
         # print(f'Before table {self.x=}, {self.y=}')
         with self.table(
                 # borders_layout="NONE",
                 first_row_as_headings=False,
-                line_height=4.5,
-                col_widths=(19, 32),
-                width=51,
+                line_height=self._table_cell_height,
+                col_widths=(18, 31),
+                width=49,
                 align='L',
                 text_align='LEFT'
                 ) as table:
@@ -755,11 +846,11 @@ class SRXScanPDF(FPDF):
             args = [*args[3:6], *args[:3], *args[6:]]
             TRANSPOSED = True
 
+        # Build images/figures from roi data
         img_ind = 0
         for roi_ind in range(len(rois)):
             if img_ind + 1 > max_roi_num:
                 break
-            # print(f'ROI index {roi_ind} abscissa is {self.x}, {self.y}')
             # print(f'Plotting image index {img_ind}')
 
             # XRF
@@ -799,9 +890,6 @@ class SRXScanPDF(FPDF):
                         data_shape = bs_run['stream0']['data'][f'{rois[roi_ind]}_image'].shape
                         data_slicing = tuple([slice(None), slice(None)]
                                             + [slice(None, None, int(s / 500) + 1) for s in data_shape[-2:]])
-
-                        # Load data with tiled
-                        # data = bs_run['stream0']['data'][f'{rois[roi_ind]}_image'][data_slicing].astype(np.float32)
 
                         # Manual load data
                         data = manual_load_data(int(bs_run.start['scan_id']),
@@ -871,8 +959,8 @@ class SRXScanPDF(FPDF):
                         data = full_data
             
             # Generate plot
-            fig_ratio = max_width / max_height
-            figsize = [max_width / 15, max_height / 15]
+            fig_ratio = max_width / self._max_height
+            figsize = [max_width / 15, self._max_height / 15]
             fig, ax = plt.subplots(figsize=figsize, layout='tight', dpi=200)
             fontsize = 12
             if 1 in data.shape: # Plot plot
@@ -880,7 +968,7 @@ class SRXScanPDF(FPDF):
                     ax.plot(np.linspace(*args[:2], int(args[2])), data.squeeze())
                 else:
                     ax.plot(np.linspace(*args[3:5], int(args[5])), data.squeeze())
-                ax.tick_params(labelleft=False)
+                # ax.tick_params(labelleft=False)
                 ax.set_ylabel('Normalized Intensity [a.u.]', fontsize=fontsize)
             else: # Plot image
                 extent = [args[0] - steps[0] / 2,
@@ -904,7 +992,7 @@ class SRXScanPDF(FPDF):
                 cax = divider.append_axes("right", size=0.1, pad=0.1)
                 cbar = fig.colorbar(im, cax=cax)
                 if colornorm == 'linear':
-                    cbar.formatter.set_powerlimits((-3, 4))
+                    cbar.formatter.set_powerlimits((-2, 2))
                 cbar.ax.tick_params(labelsize=fontsize)
                 ax.set_aspect('equal')
                 ax.set_ylabel(f"{full_motors[1]} [{motor_units[1]}]", fontsize=fontsize)
@@ -914,14 +1002,14 @@ class SRXScanPDF(FPDF):
                          fontsize=fontsize,
                          pad=15)
 
-            pdf_img, img_height, img_width = self._image_from_figure(fig, max_height, max_width)
+            pdf_img, img_height, img_width = self._image_from_figure(fig, self._max_height, max_width)
             
             # With tables
             if img_ind == 0:
                 # print('Plotting first index') 
                 img_x = self.x + ((self.w - self.r_margin) - self.x - img_width) / 2
                 self.image(pdf_img, x=img_x, h=img_height, keep_aspect_ratio=True)
-                self.set_xy(self.l_margin, reset_y + max_height + 1) # Extra 1 to prevent overlap
+                self.set_xy(self.l_margin, reset_y + self._max_height + self._offset_height)
                 reset_y = self.y
 
             # Left of three
@@ -943,7 +1031,7 @@ class SRXScanPDF(FPDF):
                 # print('Plotting in location 2')
                 img_x = self.w - self.r_margin - img_width
                 self.image(pdf_img, x=img_x, h=img_height, keep_aspect_ratio=True)
-                self.set_xy(self.l_margin, reset_y + max_height + 1) # add max height for next line
+                self.set_xy(self.l_margin, reset_y + self._max_height + self._offset_height)
                 reset_y = self.y
             
             # Move to next image index
@@ -951,7 +1039,7 @@ class SRXScanPDF(FPDF):
         
         # Cleanup
         if img_ind == 0 or (img_ind > 1 and (img_ind - 2) % 3 != 2):
-            self.set_xy(self.l_margin, self.y + max_height + 1.5)
+            self.set_xy(self.l_margin, self.y + self._max_height + self._gap_height)
             # print('first cleanup call')
         elif (img_ind - 1) % 3 != 2:
             self.set_xy(self.l_margin, self.y + 0.5)
@@ -964,6 +1052,9 @@ class SRXScanPDF(FPDF):
                      scan_kwargs):
         """Add data specific to XAS_STEP scans"""
 
+        if self._verbose:
+            print('Adding XAS_STEP...')
+
         self._add_xas_general(bs_run, scan_data, scan_kwargs)
 
 
@@ -973,6 +1064,9 @@ class SRXScanPDF(FPDF):
                     scan_data,
                     scan_kwargs):
         """Add data specific to XAS_STEP scans"""
+
+        if self._verbose:
+            print('Adding XAS_FLY...')
 
         self._add_xas_general(bs_run, scan_data, scan_kwargs)
 
@@ -985,13 +1079,7 @@ class SRXScanPDF(FPDF):
         """Add data specific to XAS_STEP and XAS_FLY scans"""
 
         # Determine if a new page needs to be added
-        max_height = 55 # Height of reference data
-        space_needed = (13 + 1.5 + max_height)
-        space_available = self.eph - self.y - self.b_margin
-        # print(f'Space needed for cell: {space_needed}')
-        # print(f'Space available: {space_available}')
-        if space_available < space_needed:
-            self.add_page()
+        self.request_cell_space(self._banner_height + self._gap_height + self._max_height + self._offset_height)
         
         # Add base scan information
         self.add_BASE_SCAN(scan_data, scan_kwargs)
@@ -1041,16 +1129,16 @@ class SRXScanPDF(FPDF):
 
         reset_y = self.y
         self.set_xy(self.x + 1.5, self.y)
-        self.set_font(style='B', size=10)
-        self.cell(h=5, new_x='LEFT', new_y='NEXT', text=f"Scan Data")
-        self.set_font(size=9)
+        self.set_font(style='B', size=self._table_header_font_size)
+        self.cell(h=self._table_header_height, new_x='LEFT', new_y='NEXT', text=f"Scan Data")
+        self.set_font(size=self._table_font_size)
         l_margin = self.l_margin 
         self.l_margin = self.x # Temp move to set table location. Probably bad
         with self.table(
                 first_row_as_headings=False,
-                line_height=4.5,
-                col_widths=(19, 32),
-                width=51,
+                line_height=self._table_cell_height,
+                col_widths=(20, 29),
+                width=49,
                 align='L',
                 text_align='LEFT'
                 ) as table:
@@ -1075,7 +1163,6 @@ class SRXScanPDF(FPDF):
                 data /= bs_run['primary']['data']['sclr_i0'][:].astype(np.float32)
                 edge_ind = np.argmax(np.gradient(data, en))
                 el_edge = all_edges_names[np.argmin(np.abs(np.array(all_edges) - en[edge_ind]))]
-
             
             elif scan_type == 'XAS_FLY' and any(['scan' in key for key in bs_run.keys()]):
                 pass
@@ -1090,7 +1177,7 @@ class SRXScanPDF(FPDF):
 
             # Plot data
             if plot_data:
-                fig, ax = plt.subplots(figsize=(max_width / 15, max_height / 15), tight_layout=True, dpi=200)
+                fig, ax = plt.subplots(figsize=(max_width / 15, self._max_height / 15), tight_layout=True, dpi=200)
                 fontsize = 12
                 ax.plot(en, data)
                 ax.scatter(en[edge_ind], data[edge_ind], marker='*', s=50, c='r')
@@ -1100,13 +1187,13 @@ class SRXScanPDF(FPDF):
                 ax.tick_params(axis='both', labelsize=fontsize)
                 ax.set_title(f"Scan {bs_run.start['scan_id']}\n{el_edge} edge : {int(en[edge_ind])} eV", fontsize=fontsize)   
 
-                pdf_img, img_height, img_width = self._image_from_figure(fig, max_height, max_width)
+                pdf_img, img_height, img_width = self._image_from_figure(fig, self._max_height, max_width)
 
                 img_x = ((self.w - self.r_margin) - self.x - img_width) / 2
                 self.image(pdf_img, x=img_x + self.x, h=img_height, keep_aspect_ratio=True)
         
         # Cleanup
-        self.set_xy(self.l_margin, reset_y + max_height + 1.5)
+        self.set_xy(self.l_margin, reset_y + self._max_height + self._gap_height)
 
 
     def add_ENERGY_RC(self,
@@ -1114,6 +1201,9 @@ class SRXScanPDF(FPDF):
                       scan_data,
                       scan_kwargs):
         """Add data specific to ENERGY_RC scans"""
+
+        if self._verbose:
+            print('Adding ENERGY_RC...')
 
         self._add_STEP_RC(bs_run,
                           scan_data,
@@ -1127,13 +1217,15 @@ class SRXScanPDF(FPDF):
                      scan_kwargs):
         """Add data specific to ANGLE_RC scans"""
 
+        if self._verbose:
+            print('Adding ANGLE_RC...')
+
         self._add_STEP_RC(bs_run,
                           scan_data,
                           scan_kwargs,
                           scan_type='angle')
 
     
-
     def _add_STEP_RC(self,
                      bs_run,
                      scan_data,
@@ -1145,13 +1237,7 @@ class SRXScanPDF(FPDF):
         scan_type = scan_type.capitalize()
 
         # Determine if a new page needs to be added
-        max_height = 55 # Height of reference data
-        space_needed = (13 + 1.5 + max_height)
-        space_available = self.eph - self.y - self.b_margin
-        # print(f'Space needed for cell: {space_needed}')
-        # print(f'Space available: {space_available}')
-        if space_available < space_needed:
-            self.add_page()
+        self.request_cell_space(self._banner_height + self._gap_height + self._max_height + self._offset_height)
         
         # Add base scan information
         self.add_BASE_SCAN(scan_data, scan_kwargs)
@@ -1195,16 +1281,16 @@ class SRXScanPDF(FPDF):
 
         reset_y = self.y
         self.set_xy(self.x + 1.5, self.y)
-        self.set_font(style='B', size=10)
-        self.cell(h=5, new_x='LEFT', new_y='NEXT', text=f"Scan Data")
-        self.set_font(size=9)
+        self.set_font(style='B', size=self._table_header_font_size)
+        self.cell(h=self._table_header_height, new_x='LEFT', new_y='NEXT', text=f"Scan Data")
+        self.set_font(size=self._table_font_size)
         l_margin = self.l_margin 
         self.l_margin = self.x # Temp move to set table location. Probably bad
         with self.table(
                 first_row_as_headings=False,
-                line_height=4.5,
-                col_widths=(19, 32),
-                width=51,
+                line_height=self._table_cell_height,
+                col_widths=(18, 31),
+                width=49,
                 align='L',
                 text_align='LEFT'
                 ) as table:
@@ -1291,7 +1377,7 @@ class SRXScanPDF(FPDF):
 
             # Plot data
             if data is not None:
-                fig, ax = plt.subplots(figsize=(max_width / 15, max_height / 15), tight_layout=True, dpi=200)
+                fig, ax = plt.subplots(figsize=(max_width / 15, self._max_height / 15), tight_layout=True, dpi=200)
                 fontsize = 12
                 ax.plot(rocking, data.squeeze())
                 ax.set_ylim(0, saturated * 1.05)
@@ -1301,13 +1387,13 @@ class SRXScanPDF(FPDF):
                 ax.tick_params(axis='both', labelsize=fontsize)
                 ax.set_title(f"Scan {bs_run.start['scan_id']}\n{roi_str}", fontsize=fontsize)   
 
-                pdf_img, img_height, img_width = self._image_from_figure(fig, max_height, max_width)
+                pdf_img, img_height, img_width = self._image_from_figure(fig, self._max_height, max_width)
 
                 img_x = ((self.w - self.r_margin) - self.x - img_width) / 2
                 self.image(pdf_img, x=img_x + self.x, h=img_height, keep_aspect_ratio=True)
         
         # Cleanup
-        self.set_xy(self.l_margin, reset_y + max_height + 1.5)
+        self.set_xy(self.l_margin, reset_y + self._max_height + self._gap_height)
     
 
     def _image_from_figure(self, fig, max_height, max_width):
@@ -1383,6 +1469,8 @@ class SRXScanPDF(FPDF):
                 scan_meta_data['scan_type'] = start['scan']['type']
             else:
                 scan_meta_data['scan_type'] = 'UNKNOWN'
+        else:
+            scan_meta_data['scan_type'] = 'UNKNOWN'
 
         if 'time' in stop:
             scan_meta_data['stop_time'] = stop['time']
@@ -1472,13 +1560,22 @@ class SRXScanPDF(FPDF):
             scan_base_data['sdd_x'] = None
             scan_base_data['sdd_x_units'] = None
 
+        # Get attenuators
+        attenuators = ['Al_050um', 'Al_100um', 'Al_250um', 'Al_500um', 'Si_250um', 'Si_650um']
+        attenuators = [f'attenuators_{att}' for att in attenuators]
+        for att in attenuators:
+            if att in baseline['data']:
+                scan_base_data[att] = baseline['data'][att][0]
+            else:
+                scan_base_data[att] = None
+
         return scan_base_data
 
 
 def generate_scan_report(start_id,
                          end_id=-1,
-                         filename=None,
                          wd=None,
+                         verbose=False,
                          **kwargs):
     
     # Default wd
@@ -1486,35 +1583,24 @@ def generate_scan_report(start_id,
         wd = os.getcwd()
 
     # Parse scan ids
-    start_id = int(start_id)
+    if start_id == -1:
+        start_id = int(c[-1].start['scan_id'])
+    else:
+        start_id = int(start_id)
     if end_id == -1:
         end_id = int(c[-1].start['scan_id'])
     elif end_id != None:
         end_id = int(end_id)
+        if end_id < start_id:
+            err_str = (f'end_id ({end_id}) of must be greater than or '
+                       + f'equal to start_id ({start_id}).')
+            raise ValueError(err_str)
     current_id = start_id
     
-    # Try to find existing file
-    if filename is not None:
-        if not isinstance(filename, str):
-            raise TypeError(f'Filename must be string not {type(filename)}')
-        filename = os.path.splitext(filename)[0] # ignore .pdf
-        pdf_path = os.path.join(wd, f'{filename}.pdf')
-        md_path = os.path.join(wd, f'{filename}_temp_md.json')
-    elif end_id != None:
-        filename = f'scan{start_id}-{end_id}_report'
-        pdf_path = os.path.join(wd, f'{filename}.pdf')
-        md_path = os.path.join(wd, f'{filename}_temp_md.json')
-    else:
-        for fname in os.listdir(wd):
-            if (os.path.splitext(fname)[1] == '.pdf'
-                and str(start_id) in fname
-                and f'{fname}_temp_md.json' in os.listdir(wd)):
-                filename = os.path.splitext(fname)[0]
-                break
-        else:
-            filename = f'scan{start_id}-{end_id}_report'
-        pdf_path = os.path.join(wd, f'{filename}.pdf')
-        md_path = os.path.join(wd, f'{filename}_temp_md.json')
+    # Setup filename and file paths
+    filename = filename = f'scan{start_id}-{end_id}_report'
+    pdf_path = os.path.join(wd, f'{filename}.pdf')
+    md_path = os.path.join(wd, f'{filename}_temp_md.json')
 
     # Read pdf and md if exists
     current_pdf = None
@@ -1527,7 +1613,7 @@ def generate_scan_report(start_id,
         current_id = pdf_md['current_id']
     
     # Construct working object
-    scan_report = SRXScanPDF()
+    scan_report = SRXScanPDF(verbose=verbose)
     # Only grab proposal md from first scan...
     scan_report.get_proposal_scan_data(current_id)
     exp_md = scan_report.exp_md
@@ -1538,8 +1624,6 @@ def generate_scan_report(start_id,
         print(f'Adding scan {current_id}...')
         scan_report.add_page()
         scan_report.add_scan(current_id, **kwargs)
-
-        # scan_report.output(os.path.join(wd, f'temp_{current_id}.pdf'))
 
         # Update md
         pdf_md = {'current_id' : current_id,
@@ -1570,16 +1654,16 @@ def generate_scan_report(start_id,
                     current_id -= 1 # This is dumb!
                     continue
 
-            elif current_id > end_id + 1:
+            elif current_id > end_id:
                 os.remove(md_path)
+                print(f'Scan report finishing...')
                 break
 
             print(f'Adding scan {current_id}...')
-            scan_report = SRXScanPDF()
+            scan_report = SRXScanPDF(verbose=verbose)
             scan_report.exp_md = exp_md
 
             scan_report._appended_pages = current_pdf.numPages - 1
-            # scan_report.get_proposal_scan_data(current_id)
 
             # Add blank page for overlay
             scan_report.add_page(disable_header=True)
@@ -1591,8 +1675,6 @@ def generate_scan_report(start_id,
             # Update md
             pdf_md = {'current_id' : current_id,
                       'abscissa' : (scan_report.x, scan_report.y)}
-
-            # scan_report.output(os.path.join(wd, f'temp_{current_id}.pdf'))
 
             # Overlay first page of new pdf to last page of previous
             new_pdf = PdfReader(io.BytesIO(scan_report.output()))
@@ -1616,21 +1698,23 @@ def generate_scan_report(start_id,
             current_pdf = PdfReader(pdf_path)
 
         except KeyboardInterrupt:
-            # Cleanup files
-            print(f'Writing interrupted for scan {current_id}. Cleaning up files...')
-            new_filename = f'scan{start_id}-{current_id - 1}_report'
-            new_pdf_path = os.path.join(wd, f'{new_filename}.pdf')
-            os.rename(pdf_path, new_pdf_path)
-            os.remove(md_path)
-            break
+            try:
+                print('') # for the '^C'
+                print('KeyboardIterrupt triggered; report generation paused. Waiting 10 sec before exiting...')
+                print('Press ctrl+C again to finalize and cleanup report in its current state.')
+                ttime.sleep(10)
+                break
+            except KeyboardInterrupt:
+                # Cleanup files
+                print('') # for the '^C'
+                print(f'Report generation finalized on scan {current_id}. Cleaning up files in their current state...')
+                new_filename = f'scan{start_id}-{current_id - 1}_report'
+                new_pdf_path = os.path.join(wd, f'{new_filename}.pdf')
+                os.rename(pdf_path, new_pdf_path)
+                os.remove(md_path)
+                break
         except Exception as e:
-            # Cleanup code
-            print(f'Error encountered for scan {current_id}. Cleaning up files and reraising error...')
-            new_filename = f'scan{start_id}-{current_id - 1}_report'
-            new_pdf_path = os.path.join(wd, f'{new_filename}.pdf')
-            os.rename(pdf_path, new_pdf_path)
-            os.remove(md_path)
+            print(f'Error encountered for scan {current_id}. Pausing report generation.')
             raise e
 
     print('done!')
-        
