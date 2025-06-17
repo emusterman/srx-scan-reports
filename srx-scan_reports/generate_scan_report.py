@@ -46,7 +46,8 @@ possible_elements = ['Si', 'P', 'S', 'Cl', 'Ar', 'K', 'Ca', 'Sc', 'Ti', 'V',
 boring_elements = ['Ar']
 
 elements = [xrfC.XrfElement(el) for el in possible_elements]
-edges = ['k', 'l1', 'l2', 'l3']
+# edges = ['k', 'l1', 'l2', 'l3']
+edges = ['k', 'l3']
 lines = ['ka1', 'kb1', 'la1', 'lb1', 'lb2', 'lg1', 'la2', 'lb3', 'lb4', 'll', 'ma1', 'mb']
 major_lines = ['ka1', 'la1', 'lb1', 'ma1']
 roi_lines = ['ka1', 'la1', 'ma1']
@@ -75,7 +76,7 @@ def _find_xrf_rois(xrf,
 
         # Parse out scan_kwargs
         if 'specific_elements' in scan_kwargs:
-            specific_elements = scan_kwargs,pop('specific_elements')
+            specific_elements = scan_kwargs.pop('specific_elements')
         if 'min_roi_num' in scan_kwargs:
             min_roi_num = scan_kwargs.pop('min_roi_num')
         if 'max_roi_num' in scan_kwargs:
@@ -97,16 +98,21 @@ def _find_xrf_rois(xrf,
         if max_roi_num == 0:
             return [], [], [], []
 
+        # print(specific_elements)
         # Process specified elements before anything else
         found_elements = []
         num_interesting_rois = 0
         if specific_elements is not None:
             for el in specific_elements:
+                # print(f'{el} in specific elements')
                 if (isinstance(el, str)
-                    and el.capitalize in possible_elements
-                    and el not in found_elements):
+                    and el.capitalize() in possible_elements):
+                    # Add check to see if the element name has been repeated
+                    # print(f'{el} added to found elements')
                     found_elements.append(xrfC.XrfElement(el))
                     num_interesting_rois += 1
+        
+        # print(found_elements)
 
         # Do not modify the original data
         xrf = xrf.copy()
@@ -229,6 +235,7 @@ def _find_xrf_rois(xrf,
         # Generate new ROIS
         rois, rois_labels = [], []
         for el in found_elements:
+            # print(f'Found {el.name}!')
             if isinstance(el, int):
                 rois.append(slice(int((el / en_step) - (100 / en_step)), int((el / en_step) + (100 / en_step))))
                 rois_labels.append('Unknown')
@@ -363,7 +370,7 @@ class SRXScanPDF(FPDF):
     
     def add_scan(self,
                  scan_id,
-                 include_peakups=True,
+                 include_optimizers=True,
                  include_unknowns=True,
                  include_failures=True,
                  **kwargs):
@@ -402,17 +409,17 @@ class SRXScanPDF(FPDF):
             # print(f'Cell took {end_y - start_y} mm.')
         elif scan_data['scan_type'] == 'XAS_STEP':
             self.add_XAS_STEP(bs_run, scan_data, scan_kwargs)
+        elif scan_data['scan_type'] == 'XAS_FLY':
+            self.add_XAS_FLY(bs_run, scan_data, scan_kwargs)            
         # elif scan_data['scan_type'] == 'XRF_STEP':
         #     self.add_XRF_STEP(bs_run, scan_data, scan_kwargs)
         elif scan_data['scan_type'] == 'ANGLE_RC':
             self.add_ANGLE_RC(bs_run, scan_data, scan_kwargs)
         elif scan_data['scan_type'] == 'ENERGY_RC':
             self.add_ENERGY_RC(bs_run, scan_data, scan_kwargs)
-        # elif scan_data['scan_type'] == 'XAS_FLY':
-        #     self.add_XAS_FLY(bs_run, scan_data, scankwargs)
-        elif scan_data['scan_type'] == 'PEAKUP':
-            if include_peakups:
-                if self.h - self.y - self.b_margin < 15:
+        elif scan_data['scan_type'] in ['PEAKUP', 'OPTIMIZE_SCALERS']:
+            if include_optimizers:
+                if self.h - self.y - self.b_margin < 15 + 1:
                     self.add_page()
                 self.add_BASE_SCAN(scan_data, scan_kwargs, add_space=True)
             else:
@@ -471,8 +478,12 @@ class SRXScanPDF(FPDF):
             duration = 'unknown'
 
         scan_labels = ['ID', 'Type', 'Status', 'Start', 'Stop', 'Duration']
+        if len(scan_data['scan_type']) <= 10:
+            scan_type_str = scan_data['scan_type']
+        else:
+            scan_type_str = f"{scan_data['scan_type'][:10]}..."
         scan_values = [str(scan_data['scan_id']),
-                       scan_data['scan_type'],
+                       scan_type_str,
                        scan_data['exit_status'].upper(),
                        ttime.strftime('%b %d %H:%M:%S', ttime.localtime(scan_data['start_time'])),
                        stop_time,
@@ -536,7 +547,7 @@ class SRXScanPDF(FPDF):
             table_width = table._width
         
         if add_space:
-            self.set_xy(self.l_margin, self.y + 1.5)
+            self.set_xy(self.l_margin, self.y + 1.5 + 1)
         else:
             self.set_xy(self.x + table_width, reset_y)
 
@@ -953,6 +964,26 @@ class SRXScanPDF(FPDF):
                      scan_kwargs):
         """Add data specific to XAS_STEP scans"""
 
+        self._add_xas_general(bs_run, scan_data, scan_kwargs)
+
+
+
+    def add_XAS_FLY(self,
+                    bs_run,
+                    scan_data,
+                    scan_kwargs):
+        """Add data specific to XAS_STEP scans"""
+
+        self._add_xas_general(bs_run, scan_data, scan_kwargs)
+
+
+    
+    def _add_xas_general(self,
+                         bs_run,
+                         scan_data,
+                         scan_kwargs):
+        """Add data specific to XAS_STEP and XAS_FLY scans"""
+
         # Determine if a new page needs to be added
         max_height = 55 # Height of reference data
         space_needed = (13 + 1.5 + max_height)
@@ -967,28 +998,46 @@ class SRXScanPDF(FPDF):
         
         # Load more useful metadata specific to XRF_FLY
         scan = bs_run.start['scan']
+        scan_type = scan['type']
 
         # all in eV
-        table_labels = ['Energy Inputs', 'Energy Steps', 'Detectors', 'Point Dwell', 'Point Number', 'Range']
-        scan_inputs = scan['scan_input'].split(', ')
-        en_inputs = [float(en) for en in scan_inputs[0][1:-1].split(' ')]
-        if en_inputs[0] < 1e3:
-            en_inputs = [en * 1e3 for en in en_inputs]
-        en_steps = scan_inputs[1][1:-1].split(' ') # should already be in eV
-        dets = [det for det in bs_run.start['detectors'] if det != 'ring_current'] # ring current is unecessary
-        nom_energy = [float(en) for en in scan['energy']]
-        if nom_energy[0] < 1e3:
-            nom_energy = [en * 1e3 for en in en_inputs]
-        nom_energy = np.round(nom_energy, 1)
-        en_range = (np.max(nom_energy) - np.min(nom_energy)) # in eV
+        if scan_type == 'XAS_STEP':
+            table_labels = ['Energy Inputs', 'Energy Steps', 'Detectors', 'Point Dwell', 'Point Number', 'Range']
+            scan_inputs = scan['scan_input'].split(', ')
+            en_inputs = [float(en) for en in scan_inputs[0][1:-1].split(' ')]
+            if en_inputs[0] < 1e3:
+                en_inputs = [en * 1e3 for en in en_inputs]
+            en_steps = scan_inputs[1][1:-1].split(' ') # should already be in eV
+            en_range = np.max(en_inputs) - np.min(en_inputs)
+            nom_energy = [float(en) for en in scan['energy']] # No better way to get number of points?
+            dets = [det for det in bs_run.start['detectors'] if det != 'ring_current'] # ring current is unecessary
 
-        table_values = [',\n'.join([str(en) for en in en_inputs]),
-                        ', '.join([str(en) for en in en_steps]),
-                        ', '.join(dets),
-                        f"{scan['dwell']} sec",
-                        str(len(nom_energy)),
-                        f"{en_range} eV"
-                        ]
+            table_values = [',\n'.join([str(en) for en in en_inputs]),
+                            ', '.join([str(en) for en in en_steps]),
+                            ', '.join(dets),
+                            f"{scan['dwell']} sec",
+                            str(len(nom_energy)),
+                            f"{en_range} eV"
+                            ]
+
+        elif scan_type == 'XAS_FLY':
+            table_labels = ['Energy Start', 'Energy Stop', 'Energy Width', 'Detectors', 'Point Dwell', 'Point Number', 'Range']
+            scan_inputs = scan['scan_input']
+            for i in range(2):
+                if scan_inputs[i] < 1e3:
+                    scan_inputs[i] *=1e3
+            en_start, en_end, en_width, dwell, num_points = scan_inputs
+            en_range = np.max(en_end - en_start)
+            dets = scan['detectors'] # ring current is unecessary
+
+            table_values = [f"{en_start} eV",
+                            f"{en_end} eV",
+                            f"{en_width} eV",
+                            ', '.join(dets),
+                            f"{scan['dwell']} sec",
+                            f"{num_points}",
+                            f"{en_range} eV"
+                            ]
 
         reset_y = self.y
         self.set_xy(self.x + 1.5, self.y)
@@ -1015,32 +1064,46 @@ class SRXScanPDF(FPDF):
         max_width = self.w - self.r_margin - self.x - 1.5
 
         # Do not even try any processing of failed scans. Too many potential failure points
-        if (scan_data['exit_status'] == 'success'
-            and 'primary' in bs_run):
+        if scan_data['exit_status'] == 'success':
+            plot_data = False
+            if scan_type == 'XAS_STEP' and 'primary' in bs_run:
+                plot_data = True
+                en = bs_run['primary']['data']['energy_energy'][:].astype(np.float32)
+                if en[0] < 1e3:
+                    en *= 1e3
+                data = np.sum([bs_run['primary']['data'][f'xs_channel0{i + 1}_mcaroi01_total_rbv'][:] for i in range(8)], axis=0, dtype=np.float32)
+                data /= bs_run['primary']['data']['sclr_i0'][:].astype(np.float32)
+                edge_ind = np.argmax(np.gradient(data, en))
+                el_edge = all_edges_names[np.argmin(np.abs(np.array(all_edges) - en[edge_ind]))]
+
             
-            en = bs_run['primary']['data']['energy_energy'][:].astype(np.float32)
-            if en[0] < 1e3:
-                en *= 1e3
-            data = np.sum([bs_run['primary']['data'][f'xs_channel0{i + 1}_mcaroi01_total_rbv'][:] for i in range(8)], axis=0, dtype=np.float32)
-            data /= bs_run['primary']['data']['sclr_i0'][:].astype(np.float32)
-            edge_ind = np.argmax(np.gradient(data, en))
-            el_edge = all_edges_names[np.argmin(np.abs(np.array(all_edges) - en[edge_ind]))]
+            elif scan_type == 'XAS_FLY' and any(['scan' in key for key in bs_run.keys()]):
+                pass
+                # plot_data = True
+                # en = bs_run['scan_001']['data']['energy'][:].astype(np.float32)
+                # if en[0] < 1e3:
+                #     en *= 1e3
+                # data = np.sum([bs_run['scan_001']['data'][f'xs_id_mono_fly_channel0{i + 1}'][:] for i in range(8)], axis=0, dtype=np.float32)
+                # data /= bs_run['scan_001']['data']['i0'][:].astype(np.float32)
+                # edge_ind = np.argmax(np.gradient(data, en))
+                # el_edge = all_edges_names[np.argmin(np.abs(np.array(all_edges) - en[edge_ind]))]
 
             # Plot data
-            fig, ax = plt.subplots(figsize=(max_width / 15, max_height / 15), tight_layout=True, dpi=200)
-            fontsize = 12
-            ax.plot(en, data)
-            ax.scatter(en[edge_ind], data[edge_ind], marker='*', s=50, c='r')
-            ax.tick_params(labelleft=False)
-            ax.set_ylabel('Normalized Intensity [a.u.]', fontsize=fontsize)
-            ax.set_xlabel('Energy [eV]', fontsize=fontsize)
-            ax.tick_params(axis='both', labelsize=fontsize)
-            ax.set_title(f"Scan {bs_run.start['scan_id']}\n{el_edge} edge : {int(en[edge_ind])} eV", fontsize=fontsize)   
+            if plot_data:
+                fig, ax = plt.subplots(figsize=(max_width / 15, max_height / 15), tight_layout=True, dpi=200)
+                fontsize = 12
+                ax.plot(en, data)
+                ax.scatter(en[edge_ind], data[edge_ind], marker='*', s=50, c='r')
+                ax.tick_params(labelleft=False)
+                ax.set_ylabel('Normalized Intensity [a.u.]', fontsize=fontsize)
+                ax.set_xlabel('Energy [eV]', fontsize=fontsize)
+                ax.tick_params(axis='both', labelsize=fontsize)
+                ax.set_title(f"Scan {bs_run.start['scan_id']}\n{el_edge} edge : {int(en[edge_ind])} eV", fontsize=fontsize)   
 
-            pdf_img, img_height, img_width = self._image_from_figure(fig, max_height, max_width)
+                pdf_img, img_height, img_width = self._image_from_figure(fig, max_height, max_width)
 
-            img_x = ((self.w - self.r_margin) - self.x - img_width) / 2
-            self.image(pdf_img, x=img_x + self.x, h=img_height, keep_aspect_ratio=True)
+                img_x = ((self.w - self.r_margin) - self.x - img_width) / 2
+                self.image(pdf_img, x=img_x + self.x, h=img_height, keep_aspect_ratio=True)
         
         # Cleanup
         self.set_xy(self.l_margin, reset_y + max_height + 1.5)
@@ -1507,7 +1570,7 @@ def generate_scan_report(start_id,
                     current_id -= 1 # This is dumb!
                     continue
 
-            elif current_id > end_id:
+            elif current_id > end_id + 1:
                 os.remove(md_path)
                 break
 
@@ -1571,45 +1634,3 @@ def generate_scan_report(start_id,
 
     print('done!')
         
-    
-
-
-
-        
-
-        
-    
-
-
-
-
-
-
-
-
-
-
-# scan_report = SRXScanPDF()
-# scan_report.exp_md = {'proposal_number' : 315950,
-#                       'proposal_title' : 'SRX Beamline Commissioning',
-#                       'proposal_PI' : 'Kiss'}
-#scan_report.t_margin = 20
-
-# scan_report.add_scan_range(164503, 164623, include_peakups=False, include_failures=False, snr_cutoff=100)
-# scan_report.add_scan_range(164528, 164530, include_peakups=False, include_failures=False, snr_cutoff=100)
-# scan_report.add_scan_range(164503, 164505)
-# scan_report.add_scan_range(166789,
-#                            166791,
-#                            include_peakups=False,
-#                            include_failures=False,
-#                            max_roi_num=4,
-#                            ignore_det_rois=['dexela'])
-# scan_report.add_scan(162006, include_peakups=False, include_failures=False, snr_cutoff=100)
-# scan_report.add_scan(162021, include_peakups=False, include_failures=False, snr_cutoff=100)
-
-# scan_report.add_scan(164505)
-# scan_report.add_scan(164507)
-# scan_report.add_scan(164535)
-# scan_report.add_scan(164540)
-
-# scan_report.output('pass-316224_cycle_2025-1.pdf')
