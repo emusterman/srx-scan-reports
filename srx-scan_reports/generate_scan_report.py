@@ -333,7 +333,7 @@ class SRXScanPDF(FPDF):
             title_words = self.exp_md['title'].split(' ')
             title_text = title_words[0]
             for word in title_words[1:]:
-                if len(title_text) + len(word) + 4 < 85:
+                if len(title_text) + len(word) + 4 < 80:
                     title_text += f' {word}'
                 else:
                     title_text += '...'
