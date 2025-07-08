@@ -29,6 +29,7 @@ from xrdmaptools.io.db_io import (
 
 
 from tiled.client import from_profile
+from tiled.queries import Key
 
 # Access data
 c = from_profile('srx')
@@ -308,6 +309,13 @@ class SRXScanPDF(FPDF):
         self._banner_table_cell_height = 4.75
         self._table_header_height = 4
         self._table_cell_height = 3.9
+        # Widths
+        self._base_table_width = 37
+        self._base_table_cols = (17, 20)
+        self._scan_table_width = 50
+        self._scan_table_cols_xrf = (18, 32) # XRF_FLY
+        self._scan_table_cols_xas = (20, 30) # XAS_STEP, XAS_FLY eventually
+        self._scan_table_cols_rc = (18, 32) # ENERGY_RC, ANGLE_RC
 
 
     def header(self):
@@ -316,7 +324,7 @@ class SRXScanPDF(FPDF):
 
         self.set_font(size=11)
 
-        self.image('/nsls2/users/emusterma/Documents/scan_reports/srx_logo.png', h=15, keep_aspect_ratio=True)
+        self.image('/nsls2/users/emusterma/Documents/Repositories/srx-scan-reports/data/srx_logo.png', h=15, keep_aspect_ratio=True)
         self.set_xy(self.l_margin, self.t_margin)
 
         with self.table(
@@ -435,10 +443,6 @@ class SRXScanPDF(FPDF):
         if self.exp_md == {}:
             self.get_proposal_scan_data(scan_id)
             self.add_page()
-        # else:
-            # Check and update metadata anyway
-            # TODO: Is this still needed?
-            # self.get_proposal_scan_data(scan_id)
 
         bs_run = c[int(scan_id)]
         # Extract metadata from start
@@ -517,25 +521,25 @@ class SRXScanPDF(FPDF):
             return
     
 
-    def add_scan_range(self,
-                       start_id,
-                       end_id=-1,
-                       **kwargs):
-        """Add scans across a specified range"""
+    # def add_scan_range(self,
+    #                    start_id,
+    #                    end_id=-1,
+    #                    **kwargs):
+    #     """Add scans across a specified range"""
 
-        end_id = c[end_id].start['scan_id']
+    #     end_id = c[end_id].start['scan_id']
 
-        if end_id <= start_id:
-            err_str = f'End ID of {end_id} must be larger than Start ID of {start_id}.'
-            raise ValueError(err_str)
+    #     if end_id <= start_id:
+    #         err_str = f'End ID of {end_id} must be larger than Start ID of {start_id}.'
+    #         raise ValueError(err_str)
 
-        # Get header metadata if it is empty
-        if self.exp_md == {}:
-            self.get_proposal_scan_data(start_id)
-            self.add_page() # start first page
+    #     # Get header metadata if it is empty
+    #     if self.exp_md == {}:
+    #         self.get_proposal_scan_data(start_id)
+    #         self.add_page() # start first page
 
-        for scan_id in tqdm(range(int(start_id), int(end_id) + 1)):
-            self.add_scan(scan_id, **kwargs)
+    #     for scan_id in tqdm(range(int(start_id), int(end_id) + 1)):
+    #         self.add_scan(scan_id, **kwargs)
 
     
     def add_BASE_SCAN(self,
@@ -632,8 +636,8 @@ class SRXScanPDF(FPDF):
                 # borders_layout="NONE",
                 first_row_as_headings=False,
                 line_height=self._table_cell_height,
-                col_widths=(17, 20),
-                width=37,
+                col_widths=self._base_table_cols,
+                width=self._base_table_width,
                 align='L'
                 ) as table:
             for i in range(len(ref_labels)):
@@ -688,10 +692,11 @@ class SRXScanPDF(FPDF):
 
             # Load summed data
             try:
-                xrf_sum = np.sum(bs_run['stream0']['data']['xs_fluor'][..., :2500], axis=(0, 1, 2)).astype(np.float32)
+                xrf_sum = np.sum(bs_run['stream0']['data']['xs_fluor'][..., :7, :2500], axis=(0, 1, 2)).astype(np.float32)
             except MemoryError:
                 # Dask version
-                xrf_sum = da.asarray(bs_run['stream0']['data']['xs_fluor'])[..., :2500].sum(axis=(0, 1, 2)).compute().astype(np.float32)
+                print('WARNING: Dask invoked for figuring sum XRF spectra!')
+                xrf_sum = da.asarray(bs_run['stream0']['data']['xs_fluor'])[..., :7, :2500].sum(axis=(0, 1, 2)).compute().astype(np.float32)
             
             # Determine energy. Hard coded for current xpress3
             energy = np.arange(0, len(xrf_sum)) * 10
@@ -752,11 +757,11 @@ class SRXScanPDF(FPDF):
         else:
             rois = []
 
-        print(f'ROIs found for XRF_FLY are {len(rois)}.')
+        # print(f'ROIs found for XRF_FLY are {len(rois)}.')
             
         # Determine if a new page needs to be added
         num_images = np.min([len(rois), max_roi_num])
-        space_needed = (self._banner_height + self._gap_height + self._offset_height + ((self._max_height + self._offset_height) * np.ceil(1 + (num_images - 1) / 3)))
+        space_needed = (self._banner_height + self._gap_height + self._offset_height + ((self._max_height + self._offset_height) * np.ceil(1 + (num_images - 1) / 3))) # a touch awful...
         self.request_cell_space(space_needed)
         
         # Add base scan information
@@ -810,8 +815,8 @@ class SRXScanPDF(FPDF):
                 # borders_layout="NONE",
                 first_row_as_headings=False,
                 line_height=self._table_cell_height,
-                col_widths=(18, 31),
-                width=49,
+                col_widths=self._scan_table_cols_xrf,
+                width=self._scan_table_width,
                 align='L',
                 text_align='LEFT'
                 ) as table:
@@ -856,7 +861,7 @@ class SRXScanPDF(FPDF):
             # XRF
             if isinstance(rois[roi_ind], slice):
                 # Load data around ROI
-                data = np.sum(bs_run['stream0']['data']['xs_fluor'][..., rois[roi_ind]], axis=(-2, -1,), dtype=np.float32)
+                data = np.sum(bs_run['stream0']['data']['xs_fluor'][..., :7, rois[roi_ind]], axis=(-2, -1,), dtype=np.float32)
                 data /= sclr
                 clims = [np.min(data), np.max(data)]
                 en_int = energy[rois[roi_ind]]
@@ -969,6 +974,7 @@ class SRXScanPDF(FPDF):
                 else:
                     ax.plot(np.linspace(*args[3:5], int(args[5])), data.squeeze())
                 # ax.tick_params(labelleft=False)
+                ax.ticklabel_format(axis='y', style='sci', scilimits=(-2, 2))
                 ax.set_ylabel('Normalized Intensity [a.u.]', fontsize=fontsize)
             else: # Plot image
                 extent = [args[0] - steps[0] / 2,
@@ -1137,8 +1143,8 @@ class SRXScanPDF(FPDF):
         with self.table(
                 first_row_as_headings=False,
                 line_height=self._table_cell_height,
-                col_widths=(20, 29),
-                width=49,
+                col_widths=self._scan_table_cols_xas,
+                width=self._scan_table_width,
                 align='L',
                 text_align='LEFT'
                 ) as table:
@@ -1159,7 +1165,7 @@ class SRXScanPDF(FPDF):
                 en = bs_run['primary']['data']['energy_energy'][:].astype(np.float32)
                 if en[0] < 1e3:
                     en *= 1e3
-                data = np.sum([bs_run['primary']['data'][f'xs_channel0{i + 1}_mcaroi01_total_rbv'][:] for i in range(8)], axis=0, dtype=np.float32)
+                data = np.sum([bs_run['primary']['data'][f'xs_channel0{i + 1}_mcaroi01_total_rbv'][:] for i in range(7)], axis=0, dtype=np.float32)
                 data /= bs_run['primary']['data']['sclr_i0'][:].astype(np.float32)
                 edge_ind = np.argmax(np.gradient(data, en))
                 el_edge = all_edges_names[np.argmin(np.abs(np.array(all_edges) - en[edge_ind]))]
@@ -1176,12 +1182,13 @@ class SRXScanPDF(FPDF):
                 # el_edge = all_edges_names[np.argmin(np.abs(np.array(all_edges) - en[edge_ind]))]
 
             # Plot data
-            if plot_data:
+            if plot_data: # Flag to catch XRF fly for now
                 fig, ax = plt.subplots(figsize=(max_width / 15, self._max_height / 15), tight_layout=True, dpi=200)
                 fontsize = 12
                 ax.plot(en, data)
                 ax.scatter(en[edge_ind], data[edge_ind], marker='*', s=50, c='r')
-                ax.tick_params(labelleft=False)
+                # ax.tick_params(labelleft=False)
+                ax.ticklabel_format(axis='y', style='sci', scilimits=(-2, 2))
                 ax.set_ylabel('Normalized Intensity [a.u.]', fontsize=fontsize)
                 ax.set_xlabel('Energy [eV]', fontsize=fontsize)
                 ax.tick_params(axis='both', labelsize=fontsize)
@@ -1205,7 +1212,7 @@ class SRXScanPDF(FPDF):
         if self._verbose:
             print('Adding ENERGY_RC...')
 
-        self._add_STEP_RC(bs_run,
+        self._add_step_rc(bs_run,
                           scan_data,
                           scan_kwargs,
                           scan_type='energy')
@@ -1220,13 +1227,13 @@ class SRXScanPDF(FPDF):
         if self._verbose:
             print('Adding ANGLE_RC...')
 
-        self._add_STEP_RC(bs_run,
+        self._add_step_rc(bs_run,
                           scan_data,
                           scan_kwargs,
                           scan_type='angle')
 
     
-    def _add_STEP_RC(self,
+    def _add_step_rc(self,
                      bs_run,
                      scan_data,
                      scan_kwargs,
@@ -1289,8 +1296,8 @@ class SRXScanPDF(FPDF):
         with self.table(
                 first_row_as_headings=False,
                 line_height=self._table_cell_height,
-                col_widths=(18, 31),
-                width=49,
+                col_widths=self._scan_table_cols_step,
+                width=self._scan_table_width,
                 align='L',
                 text_align='LEFT'
                 ) as table:
@@ -1381,7 +1388,8 @@ class SRXScanPDF(FPDF):
                 fontsize = 12
                 ax.plot(rocking, data.squeeze())
                 ax.set_ylim(0, saturated * 1.05)
-                ax.tick_params(labelleft=False)
+                # ax.tick_params(labelleft=False)
+                ax.ticklabel_format(axis='y', style='sci', scilimits=(-2, 2))
                 ax.set_ylabel('Normalized Intensity [a.u.]', fontsize=fontsize)
                 ax.set_xlabel(f'{scan_type} [{units}]', fontsize=fontsize)
                 ax.tick_params(axis='both', labelsize=fontsize)
@@ -1424,19 +1432,26 @@ class SRXScanPDF(FPDF):
         start = c[int(scan_id)].start
         exp_md = {}
 
+        # Add proposal information
         for key in ['proposal_id', 'title', 'pi_name']:
             if key in start['proposal']:
                 exp_md[key] = start['proposal'][key]
             else:
                 exp_md[key] = None
+        # Add cycle
+        if 'cycle' in start:
+            exp_md['cycle'] = start['cycle']
+        else:
+            exp_md['cycle'] = None
         
         UPDATED_EXP_MD = False
         for key, value in exp_md.items():
             if key not in self.exp_md:
-                self.exp_md[key] = value
+                UPDATED_EXP_MD = True
             elif self.exp_md[key] != value:
                 UPDATED_EXP_MD = True
-        
+            self.exp_md[key] = value
+            
         return UPDATED_EXP_MD
 
     def _get_start_scan_data(self,
@@ -1662,6 +1677,203 @@ def generate_scan_report(start_id,
             print(f'Adding scan {current_id}...')
             scan_report = SRXScanPDF(verbose=verbose)
             scan_report.exp_md = exp_md
+
+            scan_report._appended_pages = current_pdf.numPages - 1
+
+            # Add blank page for overlay
+            scan_report.add_page(disable_header=True)
+
+            # Set cursor location
+            scan_report.set_xy(*pdf_md['abscissa'])
+            # Add new scan
+            scan_report.add_scan(current_id, **kwargs)
+            # Update md
+            pdf_md = {'current_id' : current_id,
+                      'abscissa' : (scan_report.x, scan_report.y)}
+
+            # Overlay first page of new pdf to last page of previous
+            new_pdf = PdfReader(io.BytesIO(scan_report.output()))
+            current_pdf.pages[-1].merge_page(page2=new_pdf.pages[0])
+            
+            # Add these pages to the new writer
+            writer = PdfWriter()
+            writer.append_pages_from_reader(current_pdf)
+            # Add any newly generated pages
+            for i in range(1, new_pdf.numPages):
+                writer.add_page(new_pdf.pages[i])
+            # Overwrite pervious file with updated pdf
+            writer.write(pdf_path)
+
+            # Overwrite previous data
+            with open(md_path, 'w') as f:
+                json.dump(pdf_md, f)
+
+            # Re-read data to update current_pdf
+            # md is already updated
+            current_pdf = PdfReader(pdf_path)
+
+        except KeyboardInterrupt:
+            try:
+                print('') # for the '^C'
+                print('KeyboardIterrupt triggered; report generation paused. Waiting 10 sec before exiting...')
+                print('Press ctrl+C again to finalize and cleanup report in its current state.')
+                ttime.sleep(10)
+                break
+            except KeyboardInterrupt:
+                # Cleanup files
+                print('') # for the '^C'
+                print(f'Report generation finalized on scan {current_id}. Cleaning up files in their current state...')
+                new_filename = f'scan{start_id}-{current_id - 1}_report'
+                new_pdf_path = os.path.join(wd, f'{new_filename}.pdf')
+                os.rename(pdf_path, new_pdf_path)
+                os.remove(md_path)
+                break
+        except Exception as e:
+            print(f'Error encountered for scan {current_id}. Pausing report generation.')
+            raise e
+
+    print('done!')
+
+
+
+def new_generate_scan_report(start_id=None,
+                             end_id=None,
+                             proposal_id=None,
+                             cycle=None,
+                             wd=None,
+                             verbose=False,
+                             **kwargs):
+    
+    # Parse requested inputs
+    # Get data from start id first
+    if start_id is not None:
+        if start_id == -1:
+            start_id = int(c[-1].start['scan_id'])
+        else:
+            start_id = int(start_id)
+
+        if start_id in c:
+            if wd is None:
+                cycle = c[start_id].start['cycle']
+                proposal_id = c[start_id].start['proposal']['proposal_id']
+                wd = f'/nsls2/data3/srx/proposals/{cycle}/pass-{proposal_id}'
+        elif proposal_id is not None and cycle is not None:
+            wd = f'/nsls2/data3/srx/proposals/{cycle}/pass-{proposal_id}'
+        elif wd is None:
+            err_str = ('Cannot determine write location. Please provide'
+                       + ' start_id of previous scan or cycle and '
+                       + 'proposal_id.')
+            raise ValueError(err_str)
+
+    # Defualt to proposal information next. This may be more popular
+    elif proposal_id is not None and cycle is not None:
+        if wd is None:
+            wd = f'/nsls2/data3/srx/proposals/{cycle}/pass-{proposal_id}'
+        lim_c = c.search(Key('cycle') == str(cycle)).search(Key('proposal.proposal_id') == str(proposal_id))
+        if len(lim_c) > 0:
+            start_id = int(lim_c[0].start['scan_id'])
+            if end_id is None: # Attempt to see if the proposal is already finished
+                last_id = int(c[-1].start['scan_id'])
+                end_id = int(lim_c[-1].start['scan_id'])
+                if last_id == end_id:
+                    end_id = None
+        else:
+            # Hoping the next scan will be correct
+            start_id = start_id = int(c[-1].start['scan_id']) + 1
+    
+    else:
+        err_str = ('Cannot determine write location. Please provide'
+                   + ' start_id of previous scan or cycle and '
+                   + 'proposal_id.')
+        raise ValueError(err_str)
+        
+    if end_id == -1:
+        end_id = int(c[-1].start['scan_id'])
+    elif end_id != None:
+        end_id = int(end_id)
+        if end_id < start_id:
+            err_str = (f'end_id ({end_id}) of must be greater than or '
+                       + f'equal to start_id ({start_id}).')
+            raise ValueError(err_str)
+    current_id = start_id
+    
+    # Setup file paths
+    directories = [x[0] for x in os.walk(wd)]
+    for d in directories:
+        if 'scan_report' in d:
+            wd = d
+            break
+    else:
+        wd = os.path.join(wd, 'scan_reports')
+        os.makedirs(wd, exist_ok=True)
+
+    # Setup filename and exact paths
+    filename = filename = f'scan{start_id}-{end_id}_report'
+    pdf_path = os.path.join(wd, f'{filename}.pdf')
+    md_path = os.path.join(wd, f'{filename}_temp_md.json')
+
+    # Read pdf and md if exists
+    current_pdf = None
+    pdf_md = None
+    # Only append to reports if the temp_md.json file also exists
+    if os.path.exists(pdf_path) and os.path.exists(md_path):
+        current_pdf = PdfReader(pdf_path)
+        with open(md_path) as f:
+            pdf_md = json.load(f)
+        current_id = pdf_md['current_id']
+    
+    # Construct working object
+    scan_report = SRXScanPDF(verbose=verbose)
+    # Only grab proposal md from first scan...
+    scan_report.get_proposal_scan_data(current_id)
+    exp_md = scan_report.exp_md
+
+    # Create first pdf page
+    if current_pdf is None: # start new
+        print(f'Initializing scan report...')
+        scan_report.add_page()
+
+        # Update md
+        pdf_md = {'current_id' : current_id - 1,
+                  'abscissa' : (scan_report.x, scan_report.y)}
+
+        # Write data
+        scan_report.output(pdf_path)
+        with open(md_path, 'w') as f:
+            json.dump(pdf_md, f)
+
+        # Read data. # md already loaded
+        current_pdf = PdfReader(pdf_path)
+    
+    # Move to continuous writing
+    while True:
+        try:
+            # Moving to next id
+            current_id += 1
+            if end_id is None:
+                recent_id = c[-1].start['scan_id']
+                if (current_id > recent_id
+                    or (current_id == recent_id
+                        and (not hasattr(c[recent_id], 'stop')
+                                 or c[recent_id].stop is None
+                                 or 'time' not in c[recent_id].stop))):
+                    print(f'Current scan ID {current_id} not yet finished. Waiting 5 minutes...')
+                    ttime.sleep(300)
+                    current_id -= 1 # This is dumb!
+                    continue
+
+            elif current_id > end_id:
+                os.remove(md_path)
+                print(f'Scan report finishing...')
+                break
+
+            print(f'Adding scan {current_id}...')
+            scan_report = SRXScanPDF(verbose=verbose)
+            scan_report.exp_md = exp_md
+            updated = scan_report.get_proposal_scan_data(current_id)
+            if updated and end_id is None:
+                print(f'Scan report finishing...')
+                break
 
             scan_report._appended_pages = current_pdf.numPages - 1
 
