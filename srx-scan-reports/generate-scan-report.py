@@ -1903,7 +1903,7 @@ def generate_scan_report(start_id=None,
     continuous : bool, optional
         This flag dicates how breaks in the proposal scope are handled.
         If False, then report generation will be paused when a scan ID
-        leaves the proposal scope. If True, scan ID outside the
+        leaves the proposal scope. If True, scan IDs outside the
         proposal scope will be skipped and scan IDs that re-enter the
         proposal scope will be appended. This only affects behavior
         when the start_id is specified and the end_id is None.
@@ -1996,7 +1996,6 @@ def generate_scan_report(start_id=None,
     detectors are included, the report will try to include another
     element to fill the 4 regions of interest, but this may not succeed
     depending on the XRF signal.
-
     """
     
     # Parse requested inputs
@@ -2009,7 +2008,7 @@ def generate_scan_report(start_id=None,
 
         if start_id in c:
             start_cycle = c[start_id].start['cycle']
-            start_propsal_id = c[start_id].start['proposal']['proposal_id']
+            start_proposal_id = c[start_id].start['proposal']['proposal_id']
 
             if ((proposal_id is not None and proposal_id != start_proposal_id)
                 or (cycle is not None and cycle != start_cycle)):
@@ -2021,6 +2020,9 @@ def generate_scan_report(start_id=None,
                             + f'\nUsing the start ID {start_id} '
                             + 'information.')
                 print(warn_str)
+                proposal_id = start_proposal_id
+                cycle = start_cycle
+            else:
                 proposal_id = start_proposal_id
                 cycle = start_cycle
             
@@ -2141,12 +2143,12 @@ def generate_scan_report(start_id=None,
             # Third check if the current_id is within the proposal
             scan_report = SRXScanPDF(verbose=verbose)
             scan_report.get_proposal_scan_data(current_id)
-            if all[scan_report.exp_md[key] == exp_md[key]
-                   for key in ['proposal_id', 'cycle']]:
-                    exp_md = scan_report.exp_md
+            if all([scan_report.exp_md[key] == exp_md[key]
+                    for key in ['proposal_id', 'cycle']]):
+                exp_md = scan_report.exp_md
             else:
                 note_str = (f'Current scan ID {current_id} not within '
-                           + f'Proposal # : {exp.md["proposal_id"]}.')
+                           + f'Proposal # : {exp_md["proposal_id"]}.')
                 print(note_str)
                 # Continuously appending or waiting to initialize
                 if continuous or current_pdf is None:
@@ -2176,6 +2178,10 @@ def generate_scan_report(start_id=None,
 
                 # Read data. # md already loaded
                 current_pdf = PdfReader(pdf_path)
+
+                # Regenerate scan report
+                scan_report = SRXScanPDF(verbose=verbose)
+                scan_report.exp_md = exp_md
             
             print(f'Adding scan {current_id}...')
             scan_report._appended_pages = current_pdf.numPages - 1
