@@ -1621,215 +1621,6 @@ class SRXScanPDF(FPDF):
         return scan_base_data
 
 
-
-def new_generate_scan_report(start_id=None,
-                             end_id=None,
-                             proposal_id=None,
-                             cycle=None,
-                             wd=None,
-                             verbose=False,
-                             **kwargs):
-    
-    # Parse requested inputs
-    # Get data from start id first
-    if start_id is not None:
-        if start_id == -1:
-            start_id = int(c[-1].start['scan_id'])
-        else:
-            start_id = int(start_id)
-
-        if start_id in c:
-            if wd is None:
-                cycle = c[start_id].start['cycle']
-                proposal_id = c[start_id].start['proposal']['proposal_id']
-                wd = f'/nsls2/data3/srx/proposals/{cycle}/pass-{proposal_id}'
-        elif proposal_id is not None and cycle is not None:
-            if wd is None:
-                wd = f'/nsls2/data3/srx/proposals/{cycle}/pass-{proposal_id}'
-        elif wd is None:
-            err_str = ('Cannot determine write location. Please provide'
-                       + ' start_id of previous scan or cycle and '
-                       + 'proposal_id.')
-            raise ValueError(err_str)
-
-    # Default to proposal information next. This may be more popular
-    elif proposal_id is not None and cycle is not None:
-        if wd is None:
-            wd = f'/nsls2/data3/srx/proposals/{cycle}/pass-{proposal_id}'
-        lim_c = c.search(Key('cycle') == str(cycle)).search(Key('proposal.proposal_id') == str(proposal_id))
-        if len(lim_c) > 0:
-            start_id = int(lim_c[0].start['scan_id'])
-            if end_id is None: # Attempt to see if the proposal is already finished
-                last_id = int(c[-1].start['scan_id'])
-                end_id = int(lim_c[-1].start['scan_id'])
-                if last_id == end_id:
-                    end_id = None
-        else:
-            # Hoping the next scan will be correct
-            start_id = int(c[-1].start['scan_id']) + 1
-    
-    else:
-        err_str = ('Cannot determine write location. Please provide'
-                   + ' start_id of previous scan or cycle and '
-                   + 'proposal_id.')
-        raise ValueError(err_str)
-  
-    if end_id is not None and end_id < 0:
-        end_id = int(c[int(end_id)].start['scan_id'])
-    elif end_id is not None:
-        end_id = int(end_id)
-        if end_id < start_id:
-            err_str = (f'end_id ({end_id}) of must be greater than or '
-                       + f'equal to start_id ({start_id}).')
-            raise ValueError(err_str)
-    current_id = start_id - 1 # Since current_id will be incremented in the while loop
-
-    print(f'Final end_id is {end_id}')
-    
-    # Setup file paths
-    if 'scan_report' not in wd: # Lacking the 's' for generizability
-        directories = [x[0] for x in os.listdir(wd)]
-        for d in directories:
-            if 'scan_report' in d:
-                wd = os.path.join(wd, d)
-                break
-        else:
-            wd = os.path.join(wd, 'scan_reports')
-    os.makedirs(wd, exist_ok=True)
-
-    # Setup filename and exact paths
-    filename = f'scan{start_id}-{end_id}_report'
-    pdf_path = os.path.join(wd, f'{filename}.pdf')
-    md_path = os.path.join(wd, f'{filename}_temp_md.json')
-
-    # Read pdf and md if exists
-    current_pdf = None
-    pdf_md = None
-    # Only append to reports if the temp_md.json file also exists
-    if os.path.exists(pdf_path) and os.path.exists(md_path):
-        current_pdf = PdfReader(pdf_path)
-        with open(md_path) as f:
-            pdf_md = json.load(f)
-        current_id = pdf_md['current_id']
-    
-    # Construct working object
-    scan_report = SRXScanPDF(verbose=verbose)
-    # Only grab proposal md from first scan...
-    scan_report.get_proposal_scan_data(start_id)
-    exp_md = scan_report.exp_md
-
-    # Create first pdf page
-    if current_pdf is None: # start new
-        print(f'Initializing scan report...')
-        scan_report.add_page()
-
-        # Update md
-        pdf_md = {'current_id' : current_id,
-                  'abscissa' : (scan_report.x, scan_report.y)}
-
-        # Write data
-        scan_report.output(pdf_path)
-        with open(md_path, 'w') as f:
-            json.dump(pdf_md, f)
-
-        # Read data. # md already loaded
-        current_pdf = PdfReader(pdf_path)
-    
-    print(f'PDF path is: {pdf_path}')
-    
-    # Move to continuous writing
-    while True:
-        try:
-            # Moving to next id
-            current_id += 1
-            
-            if end_id is None:
-                recent_id = c[-1].start['scan_id']
-                if (current_id > recent_id
-                    or (current_id == recent_id
-                        and (not hasattr(c[recent_id], 'stop')
-                                 or c[recent_id].stop is None
-                                 or 'time' not in c[recent_id].stop))):
-                    print(f'Current scan ID {current_id} not yet finished. Waiting 5 minutes...')
-                    ttime.sleep(300)
-                    current_id -= 1 # This is dumb!
-                    continue
-
-            elif current_id > end_id:
-                os.remove(md_path)
-                print(f'Scan report finishing...')
-                break
-
-            print(f'Adding scan {current_id}...')
-            scan_report = SRXScanPDF(verbose=verbose)
-            scan_report.exp_md = exp_md
-            updated = scan_report.get_proposal_scan_data(current_id)
-            if updated and end_id is None:
-                print(f'Scan report finishing...')
-                break
-
-            scan_report._appended_pages = current_pdf.numPages - 1
-
-            # Add blank page for overlay
-            scan_report.add_page(disable_header=True)
-
-            # Set cursor location
-            scan_report.set_xy(*pdf_md['abscissa'])
-            # Add new scan
-            scan_report.add_scan(current_id, **kwargs)
-            # Update md
-            pdf_md = {'current_id' : current_id,
-                      'abscissa' : (scan_report.x, scan_report.y)}
-
-            # Overlay first page of new pdf to last page of previous
-            new_pdf = PdfReader(io.BytesIO(scan_report.output()))
-            current_pdf.pages[-1].merge_page(page2=new_pdf.pages[0])
-            
-            # Add these pages to the new writer
-            writer = PdfWriter()
-            writer.append_pages_from_reader(current_pdf)
-            # Add any newly generated pages
-            for i in range(1, new_pdf.numPages):
-                writer.add_page(new_pdf.pages[i])
-            # Overwrite pervious file with updated pdf
-            writer.write(pdf_path)
-
-            # Overwrite previous data
-            with open(md_path, 'w') as f:
-                json.dump(pdf_md, f)
-
-            # Re-read data to update current_pdf
-            # md is already updated
-            current_pdf = PdfReader(pdf_path)
-
-        except KeyboardInterrupt:
-            try:
-                print('') # for the '^C'
-                print('KeyboardIterrupt triggered; report generation paused. Waiting 10 sec before exiting...')
-                print('Press ctrl+C again to finalize and cleanup report in its current state.')
-                ttime.sleep(10)
-                break
-            except KeyboardInterrupt:
-                # Cleanup files
-                print('') # for the '^C'
-                print(f'Report generation finalized on scan {current_id}. Cleaning up files in their current state...')
-                new_filename = f'scan{start_id}-{current_id - 1}_report'
-                new_pdf_path = os.path.join(wd, f'{new_filename}.pdf')
-                os.rename(pdf_path, new_pdf_path)
-                os.remove(md_path)
-                break
-        except KeyError as e:
-            print(f'WARNING: Quick error catch. Scan ID likely not in database.')
-            print(f'\t{e}')
-            print('Continuing without most recent scan ID.')
-            ttime.sleep(10)
-        except Exception as e:
-            print(f'Error encountered for scan {current_id}. Pausing report generation.')
-            raise e
-
-    print('done!')
-
-
 def generate_scan_report(start_id=None,
                          end_id=None,
                          proposal_id=None,
@@ -1980,12 +1771,13 @@ def generate_scan_report(start_id=None,
     ValueError if insufficient information is provided to determine the
         report write location, or if the start_id is greater than the
         end_id.
+    TypeError if key in kwargs is not expected.
     
     Examples
     --------
     After loading this file.
 
-    >>> generate_scan_report(12345, continous=False, max_roi_num=4,
+    >>> generate_scan_report(12345, continuous=False, max_roi_num=4,
     ... specific_elements=['Fe', 'Cr', 'Ni'])
 
     This will start generating a report starting with scan ID 12345 and
@@ -1997,6 +1789,18 @@ def generate_scan_report(start_id=None,
     element to fill the 4 regions of interest, but this may not succeed
     depending on the XRF signal.
     """
+
+    # Quick function to get keyword argument names
+    get_kwargs = lambda func : func.__code__.co_varnames[len(func.__defaults__) - 1 : func.__code__.co_argcount]
+
+    # Parse kwargs to make sure they are useful. Add functions and methods as necessary
+    useful_kwargs = (list(get_kwargs(SRXScanPDF.add_scan))
+                     + list(get_kwargs(SRXScanPDF.add_XRF_FLY))
+                     + list(get_kwargs(_find_xrf_rois)))
+    for key in kwargs.keys():
+        if key not in useful_kwargs:
+            err_str = f"generate_scan_report got an unexpected keyword argument '{key}'"
+            raise TypeError(err_str)
     
     # Parse requested inputs
     # Get data from start id first
