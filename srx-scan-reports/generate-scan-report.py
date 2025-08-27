@@ -15,6 +15,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.colors import LogNorm
 import matplotlib.ticker as ticker
+from matplotlib_scalebar.scalebar import ScaleBar
 from PIL import Image
 from scipy.signal import find_peaks
 import skbeam.core.constants.xrf as xrfC
@@ -26,7 +27,6 @@ from xrdmaptools.io.db_io import (
     manual_load_data,
     load_step_rc_data
 )
-
 
 from tiled.client import from_profile
 from tiled.queries import Key
@@ -47,8 +47,8 @@ possible_elements = ['Si', 'P', 'S', 'Cl', 'Ar', 'K', 'Ca', 'Sc', 'Ti', 'V',
 boring_elements = ['Ar']
 
 elements = [xrfC.XrfElement(el) for el in possible_elements]
-# edges = ['k', 'l1', 'l2', 'l3']
-edges = ['k', 'l3']
+edges = ['k', 'l1', 'l2', 'l3']
+# edges = ['k', 'l3']
 lines = ['ka1', 'kb1', 'la1', 'lb1', 'lb2', 'lg1', 'la2', 'lb3', 'lb4', 'll', 'ma1', 'mb']
 major_lines = ['ka1', 'la1', 'lb1', 'ma1']
 roi_lines = ['ka1', 'la1', 'ma1']
@@ -107,18 +107,18 @@ def _find_xrf_rois(xrf,
         if max_roi_num == 0:
             return [], [], [], []
 
-        # print(specific_elements)
         # Process specified elements before anything else
-        found_elements = []
+        found_elements, specific_lines  = [], []
         num_interesting_rois = 0
         if specific_elements is not None:
             for el in specific_elements:
                 # print(f'{el} in specific elements')
                 if (isinstance(el, str)
-                    and el.capitalize() in possible_elements):
+                    and el.split('_')[0].capitalize() in possible_elements):
                     # Add check to see if the element name has been repeated
                     # print(f'{el} added to found elements')
-                    found_elements.append(xrfC.XrfElement(el))
+                    found_elements.append(xrfC.XrfElement(el.split('_')[0].capitalize()))
+                    specific_lines.append(el)
                     num_interesting_rois += 1
 
         # Convert energy to eV
@@ -241,13 +241,23 @@ def _find_xrf_rois(xrf,
                         num_interesting_rois += 1
 
         # Generate new ROIS
-        rois, rois_labels = [], []
+        rois, roi_labels = [], []
         for el in found_elements:
+            # Add specified lines first
+            if el.sym in [line.split('_')[0] for line in specific_lines]:
+                line = specific_lines[[line.split('_')[0] for line in specific_lines].index(el.sym)].split('_')[-1]
+                line_en = el.emission_line[line] * 1e3
+                rois.append(slice(int((line_en / en_step) - (100 / en_step)), int((line_en / en_step) + (100 / en_step))))
+                roi_labels.append(f'{el.sym}_{line}')
+                if verbose:
+                    print(f'Specified element ({el.sym}) with line ({line}) added.')
+                continue
+
             if isinstance(el, int):
                 if verbose:
                     print(f'Found unknown ROI around {el} eV.')
                 rois.append(slice(int((el / en_step) - (100 / en_step)), int((el / en_step) + (100 / en_step))))
-                rois_labels.append('Unknown')
+                roi_labels.append('Unknown')
                 continue
             
             # Ignore argon mostly
@@ -265,14 +275,14 @@ def _find_xrf_rois(xrf,
                     if verbose:
                         print(f'Highest yield fluorescence line for {el.sym} is {line}.')
                     rois.append(slice(int((line_en / en_step) - (100 / en_step)), int((line_en / en_step) + (100 / en_step))))
-                    rois_labels.append(f'{el.sym}_{line}')
+                    roi_labels.append(f'{el.sym}_{line}')
                     break
             else:
                 if verbose:
                     print(f'No fluorescence line found for {el.sym} with an incident energy of {incident_energy} eV!')
                     print(f'Cannot generate ROI for {el.sym}!')
 
-        return rois, rois_labels
+        return rois, roi_labels
 
 
 class SRXScanPDF(FPDF):
@@ -415,9 +425,18 @@ class SRXScanPDF(FPDF):
     
 
     def request_cell_space(self,
-                           space_needed):
+                           num_images=None,
+                           space_needed=None):
+        # Check remaining space on page and add new page if insufficient
         
         space_available = self.eph - self.y - self.b_margin
+        if space_needed is None:
+            if num_images is None:
+                raise ValueError('Must define space_needed or num_images!')
+            space_needed = (self._banner_height
+                            + self._gap_height
+                            + self._offset_height
+                            + ((self._max_height + self._offset_height) * np.ceil(1 + (num_images - 1) / 3))) # a touch awful...
         
         if self._verbose:
             print(f'Space needed for cell: {space_needed}')
@@ -435,8 +454,6 @@ class SRXScanPDF(FPDF):
                  **kwargs):
         """Add a scan from a scan_id"""
 
-        # print(f'Adding scan {scan_id}')
-
         scan_kwargs = kwargs
               
         # Add first page if empty
@@ -446,7 +463,7 @@ class SRXScanPDF(FPDF):
 
         bs_run = c[int(scan_id)]
         # Extract metadata from start
-        scan_data = self._get_start_scan_data(bs_run)
+        scan_data = self.get_start_scan_data(bs_run)
 
         # Skip failed scans if not including failures
         if (not include_failures
@@ -454,7 +471,7 @@ class SRXScanPDF(FPDF):
             return
 
         # Extract reference data from baseline
-        scan_data.update(self._get_baseline_scan_data(bs_run))        
+        scan_data.update(self.get_baseline_scan_data(bs_run))        
 
         # Build report entry
         if scan_data['scan_type'] == 'XRF_FLY':
@@ -478,8 +495,12 @@ class SRXScanPDF(FPDF):
             if self._verbose:
                 print(f'Cell took {end_y - start_y} mm.')
 
-        # elif scan_data['scan_type'] == 'XRF_STEP':
-        #     self.add_XRF_STEP(bs_run, scan_data, scan_kwargs)
+        elif scan_data['scan_type'] == 'XRF_STEP':
+            start_y = self.y
+            self.add_XRF_STEP(bs_run, scan_data, scan_kwargs)
+            end_y = self.y
+            if self._verbose:
+                print(f'Cell took {end_y - start_y} mm.')
 
         elif scan_data['scan_type'] == 'ANGLE_RC':
             start_y = self.y
@@ -491,6 +512,13 @@ class SRXScanPDF(FPDF):
         elif scan_data['scan_type'] == 'ENERGY_RC':
             start_y = self.y
             self.add_ENERGY_RC(bs_run, scan_data, scan_kwargs)
+            end_y = self.y
+            if self._verbose:
+                print(f'Cell took {end_y - start_y} mm.')
+        
+        elif scan_data['scan_type'] == 'STATIC_XRD':
+            start_y = self.y
+            self.add_STATIC_XRD(bs_run, scan_data, scan_kwargs)
             end_y = self.y
             if self._verbose:
                 print(f'Cell took {end_y - start_y} mm.')
@@ -511,7 +539,10 @@ class SRXScanPDF(FPDF):
                         + "not yet support for SRX scan reports.")
             print(warn_str)
             start_y = self.y
-            self.request_cell_space(self._banner_height + self._max_height + self._gap_height + self._offset_height)
+            self.request_cell_space(space_needed=(self._banner_height
+                                                  + self._max_height
+                                                  + self._gap_height
+                                                  + self._offset_height))
             self.add_BASE_SCAN(scan_data, scan_kwargs, add_space=True)
             end_y = self.y
             if self._verbose:
@@ -519,27 +550,6 @@ class SRXScanPDF(FPDF):
 
         else:
             return
-    
-
-    # def add_scan_range(self,
-    #                    start_id,
-    #                    end_id=-1,
-    #                    **kwargs):
-    #     """Add scans across a specified range"""
-
-    #     end_id = c[end_id].start['scan_id']
-
-    #     if end_id <= start_id:
-    #         err_str = f'End ID of {end_id} must be larger than Start ID of {start_id}.'
-    #         raise ValueError(err_str)
-
-    #     # Get header metadata if it is empty
-    #     if self.exp_md == {}:
-    #         self.get_proposal_scan_data(start_id)
-    #         self.add_page() # start first page
-
-    #     for scan_id in tqdm(range(int(start_id), int(end_id) + 1)):
-    #         self.add_scan(scan_id, **kwargs)
 
     
     def add_BASE_SCAN(self,
@@ -606,10 +616,7 @@ class SRXScanPDF(FPDF):
                 self.set_xy(self.l_margin, self.y + self._gap_height)
             return
 
-        # ref_labels = ['Energy', 'Coarse X', 'Coarse Y', 'Coarse Z', 'Top X', 'Top Z', 'Theta', 'Scanner X', 'Scanner Y', 'Scanner Z', 'SDD X']
-        # ref_values = [scan_data[key] for key in ['energy', 'x', 'y', 'z', 'topx', 'topz', 'th', 'sx', 'sy', 'sz', 'sdd_x']]
-        # ref_units = [scan_data[f'{key}_units'] for key in ['energy', 'x', 'y', 'z', 'topx', 'topz', 'th', 'sx', 'sy', 'sz', 'sdd_x']]
-        # ref_precision = [0, 1, 1, 1, 1, 1, 3, 3, 3, 3, 0]
+        # Main table components
         ref_labels = ['Energy', 'Coarse X', 'Coarse Y', 'Coarse Z', 'Top X', 'Top Z', 'Theta', 'Scanner X', 'Scanner Y', 'Scanner Z']
         ref_values = [scan_data[key] for key in ['energy', 'x', 'y', 'z', 'topx', 'topz', 'th', 'sx', 'sy', 'sz']]
         ref_units = [scan_data[f'{key}_units'] for key in ['energy', 'x', 'y', 'z', 'topx', 'topz', 'th', 'sx', 'sy', 'sz']]
@@ -677,22 +684,61 @@ class SRXScanPDF(FPDF):
             self.set_xy(self.l_margin, self.y + self._gap_height)
         else:
             self.set_xy(self.x + table_width, reset_y)
+        
+        if self._verbose:
+            print('BASE_SCAN added!')
 
-    
+
     def add_XRF_FLY(self,
                     bs_run,
                     scan_data,
-                    scan_kwargs,
-                    min_roi_num=1,
-                    max_roi_num=10, # Hard capping for too many elements
-                    scaler_rois=[],
-                    ignore_det_rois=[],
-                    colornorm='linear'
-                    ):
+                    scan_kwargs):
         """Add data specific to XRF_FLY scans"""
 
         if self._verbose:
-            print('Adding XRF_FLY...')    
+            print('Adding XRF_FLY...')
+
+        self._add_xrf_general(bs_run,
+                              scan_data,
+                              scan_kwargs,
+                              scan_type='fly')
+
+
+    def add_XRF_STEP(self,
+                     bs_run,
+                     scan_data,
+                     scan_kwargs):
+        """Add data specific to XRF_STEP scans"""
+
+        if self._verbose:
+            print('Adding XRF_STEP...')
+
+        self._add_xrf_general(bs_run,
+                              scan_data,
+                              scan_kwargs,
+                              scan_type='step')
+
+
+    def _add_xrf_general(self,
+                         bs_run,
+                         scan_data,
+                         scan_kwargs,
+                         scan_type,
+                         min_roi_num=1,
+                         max_roi_num=10, # Hard capping for too many elements
+                         scaler_rois=[],
+                         ignore_det_rois=[],
+                         colornorm='linear'):
+        """Add data specific to XRF_FLY and XRF_STEP scans"""
+
+        # Parse scan_type
+        scan_type = scan_type.lower()
+        if scan_type == 'fly':
+            stream = 'stream0'
+        elif scan_type == 'step':
+            stream = 'primary'
+        else:
+            raise ValueError("xrf scan_type must be 'fly' or 'step'")
 
         # Parse other kwargs. This allows for the xrf_fly specific defaults
         if 'min_roi_num' in scan_kwargs:
@@ -704,28 +750,32 @@ class SRXScanPDF(FPDF):
         if 'ignore_det_rois' in scan_kwargs:
             ignore_det_rois = scan_kwargs.pop('ignore_det_rois')
         if 'colornorm' in scan_kwargs:
-            colornorm = scan_kwargs.pop('colornorm')  
+            colornorm = scan_kwargs.pop('colornorm')              
+
+        # Load more useful metadata specific to XRF mapping
+        scan = bs_run.start['scan']
+
+        all_dets = [det for det in scan['detectors']]
+        useful_dets = [det for det in all_dets if det not in ['ring_current', 'nano_vlm']]
+        roi_dets = [det for det in useful_dets if det not in ignore_det_rois]
 
         # Find rois
         # Do not even try any processing of failed scans. Too many potential failure points
+        rois, roi_labels = [], []
         if (scan_data['exit_status'] == 'success'
-            and 'stream0' in bs_run):
-
-            # Load summed data
-            try:
-                xrf_sum = np.sum(bs_run['stream0']['data']['xs_fluor'][..., :7, :2500], axis=(0, 1, 2)).astype(np.float32)
-            except MemoryError:
-                # Dask version
-                print('WARNING: Dask invoked for figuring sum XRF spectra!')
-                xrf_sum = da.asarray(bs_run['stream0']['data']['xs_fluor'])[..., :7, :2500].sum(axis=(0, 1, 2)).compute().astype(np.float32)
-            
-            # Determine energy. Hard coded for current xpress3
-            energy = np.arange(0, len(xrf_sum)) * 10
+            and stream in bs_run):
 
             # Load scaler for nomalization later. May be reloaded if plotting scaler keys
-            for sclr_key in ['i0', 'im']:
-                if not np.all(bs_run['stream0']['data'][sclr_key][:] <= 0):
-                    sclr = bs_run['stream0']['data'][sclr_key][:].astype(np.float32)
+            sclr_keys = ['i0', 'im']
+            if scan_type == 'step':
+                sclr_keys = [f'sclr_{key}' for key in sclr_keys]
+            
+            for sclr_key in sclr_keys:
+                if not np.all(bs_run[stream]['data'][sclr_key][:] <= 0):
+                    if scan_type == 'fly':
+                        sclr = bs_run[stream]['data'][sclr_key][:].astype(np.float32)
+                    else:
+                        sclr = self._load_and_reshape_step_data(bs_run, sclr_key)
                     sclr[sclr < 1] = np.mean(sclr[sclr >= 1]) # Handles zeros
                     break
             else:
@@ -733,40 +783,17 @@ class SRXScanPDF(FPDF):
                             + f"for scan {bs_run.start['scan_id']}. "
                             + "Proceeding with unormalized data.")
                 print(warn_str)
-                sclr = np.ones(bs_run['stream0']['data'][sclr_key].shape)
+                sclr = np.ones(bs_run[stream]['data'][sclr_key].shape)
 
-            roi_dets = bs_run.start['scan']['detectors']
-            roi_dets = [det for det in roi_dets if det not in ignore_det_rois]
-
-            # Identify peaks and determine ROIS
-            # May replace with saved ROIS later
-            if 'xs' in roi_dets:
-                (rois,
-                 rois_labels) = _find_xrf_rois(xrf_sum,
-                                               energy,
-                                               scan_data['energy'],
-                                               min_roi_num=min_roi_num,
-                                               max_roi_num=max_roi_num,
-                                               scan_kwargs=scan_kwargs,
-                                               verbose=self._verbose)
-                
-            else:
-                rois, rois_labels = [], []
-            
-            # Make a consideration for area detectors. Assume that if they were added, their signal is a useful roi
-            dets_added = 0
-            # Will add merlin first and only merlin if max_roi_num is 1
-            if ('merlin' in roi_dets
-                and dets_added < max_roi_num): # Must be less than
-                rois.insert(0, 'merlin')
-                rois_labels.insert(0, 'merlin')
-                dets_added += 1
-            if ('dexela' in roi_dets
-                and dets_added < max_roi_num): # Must be less than
-                rois.insert(0, 'dexela')
-                rois_labels.insert(0, 'dexela')
-                dets_added += 1
-            # Then add any indicated scalers
+            # Add rois and roi_labels
+            # Add vlm if acquired and not ignored
+            if ('nano_vlm' in all_dets
+                and not any(['vlm' in det for det in ignore_det_rois])
+                and 'camera_snapshot' in bs_run
+                and 'nano_vlm_image' in bs_run['camera_snapshot']['data']):
+                rois.append('vlm')
+                roi_labels.append('vlm')
+            # Add scaler keys
             for scaler_roi in scaler_rois:
                 # This check could happen sooner...
                 if str(scaler_roi).lower() not in ['i0', 'im', 'it']:
@@ -775,10 +802,55 @@ class SRXScanPDF(FPDF):
                                 + "\nSkipping scaler roi.")
                     print(warn_str)
                     continue
-                if dets_added < max_roi_num:
-                    rois.insert(0, str(scaler_roi).lower())
-                    rois_labels.insert(0, str(scaler_roi).lower())
-                    dets_added += 1
+                rois.append(str(scaler_roi).lower())
+                roi_labels.append(str(scaler_roi).lower())
+            # Add area detectors
+            if 'dexela' in roi_dets:
+                rois.append('dexela')
+                roi_labels.append('dexela')
+            if 'merlin' in roi_dets:
+                rois.append('merlin')
+                roi_labels.append('merlin')
+            # Add xs rois
+            if ('xs' in roi_dets
+                and len(rois) < max_roi_num):
+                # Grab user-determined roi_information
+                if isinstance(scan['detectors'], dict):
+                    xs_det_rois = scan['detectors']['xs']
+                    xs_rois = [xs_det_rois[f'roi{ind + 1}'] for ind in range(len(xs_det_rois))]
+                    xs_rois = [roi for roi in xs_rois if roi != '']
+
+                    if 'specific_elements' in scan_kwargs:
+                        scan_kwargs['specific_elements'] = xs_rois + scan_kwargs['specific_elements']
+                    else:
+                        scan_kwargs['specific_elements'] = xs_rois
+                
+                # Load summed data
+                if scan_type == 'fly':
+                    try:
+                        xrf_sum = np.sum(bs_run[stream]['data']['xs_fluor'][..., :7, :2500], axis=(0, 1, 2)).astype(np.float32)
+                    except MemoryError:
+                        # Dask version
+                        print('WARNING: Dask invoked for sum XRF spectra!')
+                        xrf_sum = da.asarray(bs_run[stream]['data']['xs_fluor'])[..., :7, :2500].sum(axis=(0, 1, 2)).compute().astype(np.float32)
+                else:
+                    xrf_sum = np.asarray([bs_run[stream]['data'][f'xs_channel0{ind + 1}_fluor'][..., :2500] for ind in range(7)]).sum(axis=(0, 1))
+                    
+                
+                # Determine energy. Hard coded for current xpress3
+                energy = np.arange(0, len(xrf_sum)) * 10                
+
+                # Identify peaks and determine ROIS
+                (xs_rois, xs_roi_labels) = _find_xrf_rois(xrf_sum,
+                                                          energy,
+                                                          scan_data['energy'],
+                                                          min_roi_num=min_roi_num,
+                                                          max_roi_num=max_roi_num,
+                                                          scan_kwargs=scan_kwargs,
+                                                          verbose=self._verbose)
+                # This can extend rois beyond the max_roi_num
+                rois.extend(xs_rois)
+                roi_labels.extend(xs_roi_labels)
 
             # Check for weird results
             if len(rois) == 0 and min_roi_num > 0:
@@ -789,19 +861,12 @@ class SRXScanPDF(FPDF):
         
         else:
             rois = []
-
-        # print(f'ROIs found for XRF_FLY are {len(rois)}.')
             
         # Determine if a new page needs to be added
-        num_images = np.min([len(rois), max_roi_num])
-        space_needed = (self._banner_height + self._gap_height + self._offset_height + ((self._max_height + self._offset_height) * np.ceil(1 + (num_images - 1) / 3))) # a touch awful...
-        self.request_cell_space(space_needed)
+        self.request_cell_space(num_images=np.min([len(rois), max_roi_num]))
         
         # Add base scan information
         self.add_BASE_SCAN(scan_data, scan_kwargs)
-        
-        # Load more useful metadata specific to XRF_FLY
-        scan = bs_run.start['scan']
 
         # Compile information
         table_labels = ['Scan Input', 'Motors', 'Detectors', 'Pixel Dwell', 'Map Shape', 'Map Size', 'Step Sizes']
@@ -811,6 +876,10 @@ class SRXScanPDF(FPDF):
         full_motors = [scan['fast_axis']['motor_name'], scan['slow_axis']['motor_name']]
         motors = [motor[11:] for motor in full_motors]
         motor_units = [scan['fast_axis']['units'], scan['slow_axis']['units']]
+        if 'dwell' in scan:
+            dwell = scan['dwell']
+        else:
+            dwell = args[6]
         
         # Convert angle deg to mdeg
         if motors[0] == 'th':
@@ -823,13 +892,17 @@ class SRXScanPDF(FPDF):
             motor_units[1] = 'deg'
 
         exts = [args[1] - args[0], args[4] - args[3]]
-        nums = [args[2], args[5]]
-        steps = [ext / (num - 1) if num != 1 else 0 for ext, num in zip(exts, nums)]
+        if scan_type == 'fly':
+            nums = [args[2], args[5]]
+            steps = [ext / (num - 1) if num != 1 else 0 for ext, num in zip(exts, nums)]
+        else:
+            steps = [args[2], args[5]]
+            nums = scan['shape']
 
         table_values = [input_str,
                         ', '.join([str(motor) for motor in motors]),
-                        ', '.join([str(v) for v in scan['detectors']]),
-                        f"{scan['dwell']} sec",
+                        ', '.join(useful_dets),
+                        f"{dwell} sec",
                         ', '.join([str(int(v)) for v in scan['shape']]),
                         f"{np.round(exts[0], 3)} {motor_units[0]}, {np.round(exts[1], 3)} {motor_units[1]}",
                         f"{np.round(steps[0], 3)} {motor_units[0]}, {np.round(steps[1], 3)} {motor_units[1]}"
@@ -843,7 +916,6 @@ class SRXScanPDF(FPDF):
         self.set_font(size=self._table_font_size)
         l_margin = self.l_margin 
         self.l_margin = self.x # Temp move to set table location. Probably bad
-        # print(f'Before table {self.x=}, {self.y=}')
         with self.table(
                 # borders_layout="NONE",
                 first_row_as_headings=False,
@@ -860,243 +932,82 @@ class SRXScanPDF(FPDF):
             table_width = table._width
         self.set_xy(self.x + table_width, reset_y)
         self.l_margin = l_margin # Reset left margin
-        
         max_width = self.epw - self.r_margin - self.x - 1.5
-        if len(rois) > 1:
-            max_width = np.min([max_width, self.epw / 3])
 
-        # Check if inputs should be transposed for plotting
-        scan_directions = []
-        for motor in motors:
-            if 'x' in motor:
-                scan_directions.append('x')
-            elif 'y' in motor:
-                scan_directions.append('y')
-            else:
-                scan_directions.append(None)
-        
-        TRANSPOSED = False
-        if (scan_directions[0] == 'y'
-            and scan_directions[1] == 'x'):
-            full_motors = full_motors[::-1]
-            motor_units = motor_units[::-1]
-            steps = steps[::-1]
-            args = [*args[3:6], *args[:3], *args[6:]]
-            TRANSPOSED = True
-
-        # Build images/figures from roi data
-        img_ind = 0
-        for roi_ind in range(len(rois)):
-            if img_ind + 1 > max_roi_num:
-                break
-            # print(f'Plotting image index {img_ind}')
-
-            # Universal variables
-            y_norm_str = ''
-
-            # XRF
-            if isinstance(rois[roi_ind], slice):
-                # Load data around ROI
-                data = np.sum(bs_run['stream0']['data']['xs_fluor'][..., :7, rois[roi_ind]], axis=(-2, -1,), dtype=np.float32)
-                data /= sclr
-                clims = [np.min(data), np.max(data)]
-                en_int = energy[rois[roi_ind]]
-                roi_str = f"{rois_labels[roi_ind]}: {int(en_int[0])} - {int(en_int[-1])} eV"
-                y_norm_str = 'Normalized '
+        if scan_type == 'fly':
+            # Check if inputs should be transposed for plotting
+            scan_directions = []
+            for motor in motors:
+                if 'x' in motor:
+                    scan_directions.append('x')
+                elif 'y' in motor:
+                    scan_directions.append('y')
+                else:
+                    scan_directions.append(None)
             
-            # Scalers or XBIC
+            TRANSPOSED = False
+            if (scan_directions[0] == 'y'
+                and scan_directions[1] == 'x'):
+                full_motors = full_motors[::-1]
+                motor_units = motor_units[::-1]
+                steps = steps[::-1]
+                args = [*args[3:6], *args[:3], *args[6:]]
+                TRANSPOSED = True
+        else:
+            TRANSPOSED = False
+        
+        # Build figures/images from roi data
+        images, max_widths = [], []
+        for roi, roi_label in zip(rois, roi_labels):
+            if len(images) > max_roi_num:
+                break
+            
+            plot_func = None
+            roi_max_width = np.min([max_width, self.epw / 3])
+
+            # VLM
+            if roi in ['vlm']:
+                fig = self._get_vlm_plot(bs_run,
+                                         max_width=max_width)
+                roi_max_width = max_width # Only one that is bigger...
+            # XRF
+            elif isinstance(roi, slice):
+                plot_func = lambda *a, **k : self._get_xrf_map_plot(*a, energy=energy, **k)
+            # XRD or DPC
+            elif roi in ['merlin', 'dexela']:
+                plot_func = lambda *a, **k : self._get_ad_map_plot(*a, **k)
+            # Scaler or XBIC
             elif rois[roi_ind] in [str(s).lower() for s in scaler_rois]:
-                data = bs_run['stream0']['data'][rois[roi_ind]][:].astype(np.float32)
-                if rois[roi_ind] != sclr_key: # Normalize if not plotting the normalization
-                    data /= sclr
-                    y_norm_str = 'Normalized '
-                clims = [np.min(data), np.max(data)]
-                roi_str = f"Scaler: {rois_labels[roi_ind]}"
-
-
-            # XRD or DPC or other area detector techniques
-            elif rois[roi_ind] in ['merlin', 'dexela']:
-                # TODO: Search for dark-field internally
-                dark = None
-
-                # Check for data
-                try:
-                    if f'{rois[roi_ind]}_image' not in bs_run['stream0']['data']:
-                        warn_str = ("WARNING: Key not in stream0 for "
-                                    + f"{rois[roi_ind]} data from scan "
-                                    + f"{scan_data['scan_id']}. Proceding "
-                                    + "without changes.")
-                        print(warn_str)
-                        continue
-                        LOAD_DATA = False # Not strictly necessary
-                    else:
-                        LOAD_DATA = True
-                except Exception as e:
-                    err_str = (f"{e}: Tiled error for {roi} "
-                            + f"from scan {scan_data['scan_id']}.")
-                    print(err_str)
-                    LOAD_DATA = True
-
-                if LOAD_DATA:
-                    try:
-                        # Pseudo binning
-                        data_shape = bs_run['stream0']['data'][f'{rois[roi_ind]}_image'].shape
-                        data_slicing = tuple([slice(None), slice(None)]
-                                            + [slice(None, None, int(s / 500) + 1) for s in data_shape[-2:]])
-
-                        # Manual load data
-                        data = manual_load_data(int(bs_run.start['scan_id']),
-                                                data_keys=[f'{rois[roi_ind]}_image'],
-                                                repair_method='fill',
-                                                verbose=False)[0][f'{rois[roi_ind]}_image']
-                        data = np.asarray([d[data_slicing[1:]] for d in data]).astype(np.float32)
-
-                        # Process data
-                        null_map = np.all(data == 0, axis=(-2, -1))
-                        if dark is None:
-                            dark = np.min(data[~null_map], axis=0) # approximate
-                        data -= dark
-                        data = median_filter(data, size=(1, 1, 2, 2)) # denoise
-                        data = np.max(data, axis=(-2, -1))
-                        data /= sclr
-                        # data[null_map] = np.min(data[~null_map])
-                        data[null_map] = 0
-
-                        # I'm not sure this is the best option
-                        # clims = [0, (2**14 - np.min(dark)) / np.min(sclr)]
-                        clims = [np.min(data), np.max(data)]
-
-                        roi_str = f"{rois_labels[roi_ind]}_max"
-                        y_norm_str = 'Normalized '
-
-                    except Exception as e:
-                        err_str = (f"{e}: Error loading {rois[roi_ind]} "
-                                    + f"from scan {scan_data['scan_id']}. "
-                                    + f"Proceding without changes.")
-                        print(err_str)
-                        continue
+                plot_func = lambda *a, **k : self._get_sclr_map_plot(*a, **k)
+            # Unknown
             else:
                 warn_str = ("WARNING: Unknown ROI encountered of type "
                             + f"{type(rois[roi_ind])} for scan "
                             + f"{scan_data['scan_id']}. Only slices "
                             + "and strings are accepted for XRF_FLY.")
                 print(warn_str)
-                continue
-
-            # Parsing data shapes
-            start_shape = tuple([int(s) for s in scan['shape']])[::-1]
-            # 1D data is fine
-            # print(f'{args=}')
-            if 1 in data.shape:
-                pass
-            else:
-                # Fly in y, transponsed data
-                if TRANSPOSED:
-                    data = data.T
-                    start_shape = start_shape[::-1]
-                    # Is the data complete?
-                    if start_shape != data.shape:
-                        full_data = np.zeros(start_shape)
-                        full_data[:] = np.nan
-                        for i in range(data.shape[1]):
-                            full_data[:, i] = data[:, i]
-                        data = full_data
-                else: # Fly in x
-                    # Is the data complete?
-                    if start_shape != data.shape:
-                        full_data = np.zeros(start_shape)
-                        full_data[:] = np.nan
-                        for i in range(data.shape[0]):
-                            full_data[i] = data[i]
-                        data = full_data
+                fig = None
             
-            # Generate plot
-            fig_ratio = max_width / self._max_height
-            figsize = [max_width / 15, self._max_height / 15]
-            fig, ax = plt.subplots(figsize=figsize, layout='tight', dpi=200)
-            fontsize = 12
-            if 1 in data.shape: # Plot plot
-                if steps[0] != 0:
-                    ax.plot(np.linspace(*args[:2], int(args[2])), data.squeeze())
-                else:
-                    ax.plot(np.linspace(*args[3:5], int(args[5])), data.squeeze())
-                # ax.tick_params(labelleft=False)
-                ax.ticklabel_format(axis='y', style='sci', scilimits=(-2, 2))
-                ax.set_ylabel(f'{y_norm_str}Intensity [a.u.]', fontsize=fontsize)
-            else: # Plot image
-                extent = [args[0] - steps[0] / 2,
-                          args[1] + steps[0] / 2,
-                          args[4] + steps[1] / 2,
-                          args[3] - steps[1] / 2]
+            if plot_func is not None:
+                fig = plot_func(bs_run,
+                                args,
+                                roi,
+                                roi_label,
+                                TRANSPOSED,
+                                sclr,
+                                sclr_key,
+                                full_motors,
+                                motor_units,
+                                max_width=roi_max_width,
+                                colornorm=colornorm
+                                )
 
-                # Change colorscale
-                if colornorm == 'log':
-                    log_min = 1 / np.max(sclr)
-                    if 'dexela' in roi_str:
-                        log_min *= 1e2
-                    data[data <= 0] = log_min
-                    clims[0] = log_min
-                
-                # print(f'{clims[0]=}')
-                # print(f'{clims[1]=}')
-
-                im = ax.imshow(data, extent=extent, norm=colornorm, vmin=clims[0], vmax=clims[1])
-                divider = make_axes_locatable(ax)
-                cax = divider.append_axes("right", size=0.1, pad=0.1)
-                cbar = fig.colorbar(im, cax=cax)
-                if colornorm == 'linear':
-                    cbar.formatter.set_powerlimits((-2, 2))
-                cbar.ax.tick_params(labelsize=fontsize)
-                ax.set_aspect('equal')
-                ax.set_ylabel(f"{full_motors[1]} [{motor_units[1]}]", fontsize=fontsize)
-            ax.tick_params(axis='both', labelsize=fontsize)
-            ax.set_xlabel(f"{full_motors[0]} [{motor_units[0]}]", fontsize=fontsize)
-            ax.set_title(f"Scan {bs_run.start['scan_id']}\n{roi_str}",
-                         fontsize=fontsize,
-                         pad=15)
-
-            pdf_img, img_height, img_width = self._image_from_figure(fig, self._max_height, max_width)
-            
-            # With tables
-            if img_ind == 0:
-                # print('Plotting first index') 
-                img_x = self.x + ((self.w - self.r_margin) - self.x - img_width) / 2
-                self.image(pdf_img, x=img_x, h=img_height, keep_aspect_ratio=True)
-                self.set_xy(self.l_margin, reset_y + self._max_height + self._offset_height)
-                reset_y = self.y
-
-            # Left of three
-            elif (img_ind - 1) % 3 == 0:
-                # print('Plotting in location 0')
-                img_x = self.l_margin
-                self.image(pdf_img, x=img_x, h=img_height, keep_aspect_ratio=True)
-                self.set_xy(self.l_margin, reset_y)
-
-            # Middle of three
-            elif (img_ind - 1) % 3 == 1:
-                # print('Plotting in location 1')
-                img_x = (self.w - img_width) / 2
-                self.image(pdf_img, x=img_x, h=img_height, keep_aspect_ratio=True)
-                self.set_xy(self.l_margin, reset_y)
-
-            # Right of three    
-            elif (img_ind - 1) % 3 == 2:
-                # print('Plotting in location 2')
-                img_x = self.w - self.r_margin - img_width
-                self.image(pdf_img, x=img_x, h=img_height, keep_aspect_ratio=True)
-                self.set_xy(self.l_margin, reset_y + self._max_height + self._offset_height)
-                reset_y = self.y
-            
-            # Move to next image index
-            img_ind += 1
+            if fig is not None:
+                images.append(self._figure_to_image(fig))
+                max_widths.append(roi_max_width)
         
-        # Cleanup
-        if img_ind == 0 or (img_ind > 1 and (img_ind - 2) % 3 != 2):
-            self.set_xy(self.l_margin, self.y + self._max_height + self._gap_height)
-            # print('first cleanup call')
-        elif (img_ind - 1) % 3 != 2:
-            self.set_xy(self.l_margin, self.y + 0.5)
-            # print('second cleanup call')
+        # Draw collected images
+        self.draw_images(images, max_widths, self._max_height)
 
 
     def add_XAS_STEP(self,
@@ -1108,8 +1019,10 @@ class SRXScanPDF(FPDF):
         if self._verbose:
             print('Adding XAS_STEP...')
 
-        self._add_xas_general(bs_run, scan_data, scan_kwargs)
-
+        self._add_xas_general(bs_run,
+                              scan_data,
+                              scan_kwargs,
+                              scan_type='step')
 
 
     def add_XAS_FLY(self,
@@ -1121,28 +1034,29 @@ class SRXScanPDF(FPDF):
         if self._verbose:
             print('Adding XAS_FLY...')
 
-        self._add_xas_general(bs_run, scan_data, scan_kwargs)
-
+        self._add_xas_general(bs_run,
+                              scan_data,
+                              scan_kwargs,
+                              scan_type='fly')
 
     
     def _add_xas_general(self,
                          bs_run,
                          scan_data,
-                         scan_kwargs):
+                         scan_kwargs,
+                         scan_type):
         """Add data specific to XAS_STEP and XAS_FLY scans"""
 
-        # Determine if a new page needs to be added
-        self.request_cell_space(self._banner_height + self._gap_height + self._max_height + self._offset_height)
-        
-        # Add base scan information
-        self.add_BASE_SCAN(scan_data, scan_kwargs)
+        # Parse scan_type
+        scan_type = scan_type.lower()
+        if scan_type not in ['fly', 'step']:
+            raise ValueError("xas scan_type must be 'fly' or 'step'")
         
         # Load more useful metadata specific to XRF_FLY
         scan = bs_run.start['scan']
-        scan_type = scan['type']
 
         # all in eV
-        if scan_type == 'XAS_STEP':
+        if scan_type == 'step':
             table_labels = ['Energy Inputs', 'Energy Steps', 'Detectors', 'Point Dwell', 'Point Number', 'Range']
             scan_inputs = scan['scan_input'].split(', ')
             en_inputs = [float(en) for en in scan_inputs[0][1:-1].split(' ')]
@@ -1151,35 +1065,47 @@ class SRXScanPDF(FPDF):
             en_steps = scan_inputs[1][1:-1].split(' ') # should already be in eV
             en_range = np.max(en_inputs) - np.min(en_inputs)
             nom_energy = [float(en) for en in scan['energy']] # No better way to get number of points?
-            dets = [det for det in bs_run.start['detectors'] if det != 'ring_current'] # ring current is unecessary
+            # Parse detectors
+            all_dets = [det for det in scan['detectors']]
+            useful_dets = [det for det in all_dets if det not in ['nano_vlm', 'ring_current']]
 
             table_values = [',\n'.join([str(en) for en in en_inputs]),
                             ', '.join([str(en) for en in en_steps]),
-                            ', '.join(dets),
+                            ', '.join(useful_dets),
                             f"{scan['dwell']} sec",
                             str(len(nom_energy)),
                             f"{en_range} eV"
                             ]
 
-        elif scan_type == 'XAS_FLY':
-            table_labels = ['Energy Start', 'Energy Stop', 'Energy Width', 'Detectors', 'Point Dwell', 'Point Number', 'Range']
+        elif scan_type == 'fly':
+            table_labels = ['Energy Start', 'Energy Stop', 'Energy Step', 'Detectors', 'Point Dwell', 'Point Number', 'Range', 'Harmonic']
             scan_inputs = scan['scan_input']
             for i in range(2):
                 if scan_inputs[i] < 1e3:
                     scan_inputs[i] *=1e3
-            en_start, en_end, en_width, dwell, num_points = scan_inputs
+            en_start, en_end, en_step, dwell, num_points = scan_inputs
             en_range = np.max(en_end - en_start)
-            dets = scan['detectors'] # ring current is unecessary
+            # Parse detectors
+            all_dets = [det for det in scan['detectors']]
+            useful_dets = [det for det in all_dets if det not in ['ring_current']]
 
             table_values = [f"{en_start} eV",
                             f"{en_end} eV",
-                            f"{en_width} eV",
-                            ', '.join(dets),
-                            f"{scan['dwell']} sec",
+                            f"{en_step} eV",
+                            ', '.join(useful_dets),
+                            f"{dwell} sec",
                             f"{num_points}",
-                            f"{en_range} eV"
+                            f"{en_range} eV",
+                            f"{scan['harmonic']}"
                             ]
+        
+        # Determine if a new page needs to be added
+        self.request_cell_space(num_images=len([det in ['nano_vlm', 'xs_id_mono_fly'] for det in all_dets]))
+        
+        # Add base scan information
+        self.add_BASE_SCAN(scan_data, scan_kwargs)
 
+        # Draw table
         reset_y = self.y
         self.set_xy(self.x + 1.5, self.y)
         self.set_font(style='B', size=self._table_header_font_size)
@@ -1204,10 +1130,39 @@ class SRXScanPDF(FPDF):
         self.l_margin = l_margin # Reset left margin
         max_width = self.w - self.r_margin - self.x - 1.5
 
-        # Do not even try any processing of failed scans. Too many potential failure points
+        images, max_widths = [], []
+        if 'nano_vlm' in all_dets:
+            fig = self._get_vlm_plot(bs_run,
+                                     max_width=max_width)
+            images.append(self._figure_to_image(fig))
+            max_widths.append(max_width)      
+
+        # Check for data and success
         if scan_data['exit_status'] == 'success':
-            plot_data = False
-            if scan_type == 'XAS_STEP' and 'primary' in bs_run:
+            if 'roi_names' in scan:
+                roi_label = scan['roi_names'][int(scan['roi_num'])]
+            elif isinstance(scan['detectors'], dict):
+                roi_label = sca['detectors']['xs']['roi1']
+            else:
+                roi_label = 'Unknown'
+
+            if roi_label != 'Unknown':
+                el, line = roi_label.split('_')
+                line_en = xrfC.XrfElement(el).emission_line[line] * 1e3
+                en_step = 10 # Hard-coded for now
+                roi = slice(int((line_en / en_step) - (100 / en_step)), int((line_en / en_step) + (100 / en_step)))
+
+                # Reduce possible edges...
+                red_edges_mask = [el in name for name in all_edges_names]
+                red_edges_names = [name for b, name in zip(red_edges_mask, all_edges_names) if b]
+                red_edges = [edge for b, edge in zip(red_edges_mask, all_edges) if b]
+            else:
+                red_edges_names = all_edges_names.copy()
+                red_edges = all_edges.copy()
+
+            # Load data
+            data = None
+            if scan_type == 'step' and 'primary' in bs_run:
                 plot_data = True
                 en = bs_run['primary']['data']['energy_energy'][:].astype(np.float32)
                 if en[0] < 1e3:
@@ -1215,32 +1170,60 @@ class SRXScanPDF(FPDF):
                 data = np.sum([bs_run['primary']['data'][f'xs_channel0{i + 1}_mcaroi01_total_rbv'][:] for i in range(7)], axis=0, dtype=np.float32)
                 data /= bs_run['primary']['data']['sclr_i0'][:].astype(np.float32)
                 edge_ind = np.argmax(np.gradient(data, en))
-                el_edge = all_edges_names[np.argmin(np.abs(np.array(all_edges) - en[edge_ind]))]
+                el_edge = red_edges_names[np.argmin(np.abs(np.array(red_edges) - en[edge_ind]))]
+
+                data = [data]
+                en = [en]
+                marker = np.asarray([[en[edge_ind], data[edge_ind]]])
+                title = f"Scan {bs_run.start['scan_id']}\n{el_edge} edge : {int(en[edge_ind])} eV"
+                labels = None
             
-            elif scan_type == 'XAS_FLY' and any(['scan' in key for key in bs_run.keys()]):
-                print('WARNING: Plotting for XAS_FLY not yet implemented.')
-                pass
+            elif (scan_type == 'fly' and any(['scan' in key for key in bs_run.keys()])):
+                try:
+                    stream_names = [key for key in bs_run.keys() if 'scan' in key]
+                    en, data, marker, labels = [], [], [], []
+                    for name in stream_names:
+                        en_i = bs_run[name]['data']['energy'][:].astype(float)
+                        data_i = np.sum([bs_run[name]['data'][f'xs_id_mono_fly_channel0{ind + 1}'][..., roi]
+                                         for ind in range(7)], axis=(0, -1)).astype(float)
+                        data_i /= bs_run[name]['data']['i0'][:].astype(float)
+                        edge_ind = np.argmax(np.gradient(data_i, en_i))
+                        el_edge = red_edges_names[np.argmin(np.abs(np.array(red_edges) - en_i[edge_ind]))]
+                        marker.append((en_i[edge_ind], data_i[edge_ind]))
 
-            # Plot data
-            if plot_data: # Flag to catch XRF fly for now
-                fig, ax = plt.subplots(figsize=(max_width / 15, self._max_height / 15), tight_layout=True, dpi=200)
-                fontsize = 12
-                ax.plot(en, data)
-                ax.scatter(en[edge_ind], data[edge_ind], marker='*', s=50, c='r')
-                # ax.tick_params(labelleft=False)
-                ax.ticklabel_format(axis='y', style='sci', scilimits=(-2, 2))
-                ax.set_ylabel('Normalized Intensity [a.u.]', fontsize=fontsize)
-                ax.set_xlabel('Energy [eV]', fontsize=fontsize)
-                ax.tick_params(axis='both', labelsize=fontsize)
-                ax.set_title(f"Scan {bs_run.start['scan_id']}\n{el_edge} edge : {int(en[edge_ind])} eV", fontsize=fontsize)   
+                        data.append(data_i)
+                        en.append(en_i)
+                    
+                    labels = stream_names
+                    # Title determined from last scan
+                    title = f"Scan {bs_run.start['scan_id']}\n{el_edge} edge : {int(en[-1][edge_ind])} eV"
+                except Exception as e:
+                    err_str = (f"{e}: Error loading {roi_label} data "
+                                + f"from XRF_FLY scan {bs_run.start['scan_id']}. "
+                                + f"Proceding without changes.")
+                    print(err_str)
+                    data = None
 
-                pdf_img, img_height, img_width = self._image_from_figure(fig, self._max_height, max_width)
 
-                img_x = ((self.w - self.r_margin) - self.x - img_width) / 2
-                self.image(pdf_img, x=img_x + self.x, h=img_height, keep_aspect_ratio=True)
-        
-        # Cleanup
-        self.set_xy(self.l_margin, reset_y + self._max_height + self._gap_height)
+            # Plot_data
+            if data is not None:
+                fig = self._get_line_plot(
+                        en,
+                        data,
+                        marker=marker,
+                        title=title,
+                        labels=labels,
+                        y_label='Normalized Intensity [a.u.]',
+                        x_label='Energy [eV]',
+                        max_height=self._max_height,
+                        max_width=max_width)
+                images.append(self._figure_to_image(fig))
+                max_widths.append(max_width)
+
+        # Draw images
+        self.draw_images(images,
+                         max_widths,
+                         self._max_height)
 
 
     def add_ENERGY_RC(self,
@@ -1283,38 +1266,37 @@ class SRXScanPDF(FPDF):
             raise ValueError('Only Energy and Angle step rocking curves accepted.')
         scan_type = scan_type.capitalize()
 
-        # Determine if a new page needs to be added
-        self.request_cell_space(self._banner_height + self._gap_height + self._max_height + self._offset_height)
-        
-        # Add base scan information
-        self.add_BASE_SCAN(scan_data, scan_kwargs)
-        
         # Load more useful metadata specific to XRF_FLY
         scan = bs_run.start['scan']
 
         table_labels = ['Scan Inputs', f'{scan_type} Step', f'{scan_type} Range', 'Detectors', 'Pixel Dwell']
         scan_inputs = scan['scan_input']
         input_str = (f"{np.round(scan_inputs[0], 0)}, {np.round(scan_inputs[1], 0)},"
-                     + f"\n{int(scan_inputs[2])}, {np.round(scan_inputs[3], 2)},")
-        dets = [det for det in bs_run.start['detectors']]
+                     + f"\n{int(scan_inputs[2])}, {np.round(scan_inputs[3], 2)}")
+        all_dets = [det for det in scan['detectors']]
+        useful_dets = [det for det in all_dets if det not in ['nano_vlm', 'ring_current']]
         
         if scan_type.lower() == 'energy':
             scan_inputs = [float(en) for en in scan_inputs]
-            rocking = scan['energy']
+            # rocking = scan['energy']
+            rocking = bs_run['primary']['data']['energy_energy'][:].copy()
             if scan_inputs[0] < 1e3:
                 scan_inputs[0] *= 1e3
                 scan_inputs[1] *= 1e3
             if rocking[0] < 1e3:
-                rocking = [en * 1e3 for en in rocking]
+                rocking *= 1e3
+            rocking = np.round(rocking.astype(float), 1)     
             units = 'eV'
         elif scan_type.lower() == 'angle':
             scan_inputs = [float(an) for an in scan_inputs]
-            rocking = scan['theta']
+            # rocking = scan['theta']
+            rocking = bs_run['primary']['data']['nano_stage_th'][:].copy()
             if scan_inputs[0] > 1e3:
                 scan_inputs[0] /= 1e3
-                scan_inputs[1] /= 1e3
-            if rocking[0] < 1e3:
-                rocking = [an * 1e3 for an in theta]
+                scan_inputs[1] /= 1e3  
+            if bs_run['primary']['config']['nano_stage_th']['nano_stage_th_motor_egu'][0] == 'mdeg': 
+                rocking /= 1e3
+            rocking = np.round(rocking.astype(float), 4)                   
             units = 'deg'
         scan_step = np.mean(np.diff(rocking))
         scan_range = np.round(np.max(rocking) - np.min(rocking), 0)    
@@ -1322,10 +1304,17 @@ class SRXScanPDF(FPDF):
         table_values = [input_str,
                         f'{scan_step} {units}',
                         f'{scan_range} {units}',
-                        ', '.join(dets),
+                        ', '.join(useful_dets),
                         f"{scan['dwell']} sec"
                         ]
 
+        # Determine if a new page needs to be added
+        self.request_cell_space(num_images=len([det in ['dexela', 'merlin', 'nano_vlm'] for det in all_dets]))
+        
+        # Add base scan information
+        self.add_BASE_SCAN(scan_data, scan_kwargs)
+
+        # Draw table
         reset_y = self.y
         self.set_xy(self.x + 1.5, self.y)
         self.set_font(style='B', size=self._table_header_font_size)
@@ -1350,112 +1339,625 @@ class SRXScanPDF(FPDF):
         self.l_margin = l_margin # Reset left margin
         max_width = self.w - self.r_margin - self.x - 1.5
 
-        # Do not even try any processing of failed scans. Too many potential failure points
-        if (scan_data['exit_status'] == 'success'
-            and 'primary' in bs_run
-            and ('dexela' in dets or 'merlin' in dets)):
+        images, max_widths = [], []
+        if 'nano_vlm' in all_dets:
+            fig = self._get_vlm_plot(bs_run,
+                                     max_width=max_width)
+            images.append(self._figure_to_image(fig))
+            max_widths.append(max_width)
 
-            # Preference for dexela
-            if 'dexela' in dets:
-                roi = 'dexela_image'
-            elif 'merlin' in dets:
-                roi = 'merlin_image'
-
-            # Check for data
-            try:
-                if roi not in bs_run['primary']['data']:
-                    warn_str = ("WARNING: Key not in primary for "
-                                + f"{roi} data from scan "
-                                + f"{scan_data['scan_id']}. Proceding "
-                                + "without changes.")
-                    print(warn_str)
-                    data = None
-                    LOAD_DATA = False
-                else:
-                    LOAD_DATA = True
-            except Exception as e:
-                err_str = (f"{e}: Tiled error for {roi} "
-                           + f"from scan {scan_data['scan_id']}.")
-                print(err_str)
-                LOAD_DATA = True
-            
-            if LOAD_DATA:
-                try:
-                    # Placeholder for eventual automatic dark acquisition
-                    dark = None
-
-                    # Load data
-                    out = load_step_rc_data(int(bs_run.start['scan_id']), verbose=False)
-                    data = np.asarray(out[0][roi])
-                    data = data.astype(np.float32)
-
-                    for key in ['i0', 'im']:
-                        if key in out[0]:
-                            sclr = out[0][key]
-                            break
-                    else:
-                        sclr = bs_run['primary']['data']['sclr_i0'][:].astype(np.float32)
-
-                    # Process data
-                    null_map = np.all(data == 0, axis=(-2, -1))
-                    if dark is None:
-                        dark = np.min(data[~null_map], axis=0) # approximate
-                    data -= dark
-                    data = median_filter(data, size=(1, 1, 2, 2)) # denoise
-                    data = np.max(data, axis=(-2, -1))
-                    data /= sclr
-                    data[null_map] = 0
-
-                    # TODO: Change from hard-coded for dexela
-                    saturated = (2**14 - np.min(dark)) / np.min(sclr)
-
-                    roi_str = f"{roi[:-6]}_max"
-                except Exception as e:
-                    err_str = (f"{e}: Error loading {roi} "
-                                + f"from scan {scan_data['scan_id']}. "
-                                + f"Proceding without changes.")
-                    print(err_str)
-                    data = None
-
-            # Plot data
-            if data is not None:
-                fig, ax = plt.subplots(figsize=(max_width / 15, self._max_height / 15), tight_layout=True, dpi=200)
-                fontsize = 12
-                ax.plot(rocking, data.squeeze())
-                ax.set_ylim(0, saturated * 1.05)
-                # ax.tick_params(labelleft=False)
-                ax.ticklabel_format(axis='y', style='sci', scilimits=(-2, 2))
-                ax.set_ylabel('Normalized Intensity [a.u.]', fontsize=fontsize)
-                ax.set_xlabel(f'{scan_type} [{units}]', fontsize=fontsize)
-                ax.tick_params(axis='both', labelsize=fontsize)
-                ax.set_title(f"Scan {bs_run.start['scan_id']}\n{roi_str}", fontsize=fontsize)   
-
-                pdf_img, img_height, img_width = self._image_from_figure(fig, self._max_height, max_width)
-
-                img_x = ((self.w - self.r_margin) - self.x - img_width) / 2
-                self.image(pdf_img, x=img_x + self.x, h=img_height, keep_aspect_ratio=True)
+        # Load AD Data
+        for det in useful_dets:
+            if det not in ['dexela', 'merlin']:
+                continue
         
-        # Cleanup
-        self.set_xy(self.l_margin, reset_y + self._max_height + self._gap_height)
+            for key in ['sclr_i0', 'sclr_im']:
+                if key in bs_run['primary']:
+                    sclr = bs_run['primary']['data'][key][:].astype(float)
+                    break
+            else:
+                sclr = np.ones(len(rocking), dtype=float)
+
+            data, roi_str = self._load_and_process_ad_data(bs_run,
+                                                           'primary',
+                                                           det,
+                                                           sclr)
+
+            # Plot_data
+            if data is not None:
+                fig = self._get_line_plot(
+                        [rocking],
+                        [data.squeeze()],
+                        title=f"Scan {bs_run.start['scan_id']}\n{roi_str}",
+                        y_label='Normalized Intensity [a.u.]',
+                        x_label=f'{scan_type} [{units}]',
+                        max_height=self._max_height,
+                        max_width=max_width)
+                images.append(self._figure_to_image(fig))
+                max_widths.append(max_width)
+
+        # Draw images
+        self.draw_images(images,
+                         max_widths,
+                         self._max_height)
     
 
-    def _image_from_figure(self, fig, max_height, max_width):
+    def add_STATIC_XRD(self,
+                       bs_run,
+                       scan_data,
+                       scan_kwargs):
+        """Add data specific to STATIC_XRF scans"""
+
+        if self._verbose:
+            print('Adding STATIC_XRD...')
+
+        # Load more useful metadata specific to XRF_FLY
+        scan = bs_run.start['scan']
+
+        table_labels = ['Scan Inputs', 'Image Num', 'Image Dwell', 'Detectors']
+        scan_inputs = scan['scan_input']
+        input_str = f"{scan_inputs[0]}, {scan_inputs[1]}"
+        all_dets = [det for det in scan['detectors']]
+        useful_dets = [det for det in all_dets if det not in ['nano_vlm', 'ring_current']]
+        roi_dets = [det for det in useful_dets if det in ['merlin', 'dexela']]
+
+        table_values = [input_str,
+                        f"{scan_inputs[0]}",
+                        f"{scan['dwell']} sec",
+                        ', '.join(useful_dets),
+                        ]
+
+        # Determine if a new page needs to be added
+        self.request_cell_space(num_images=len([det in ['dexela', 'merlin', 'nano_vlm'] for det in all_dets]))
+        
+        # Add base scan information
+        self.add_BASE_SCAN(scan_data, scan_kwargs)
+
+        # Draw table
+        reset_y = self.y
+        self.set_xy(self.x + 1.5, self.y)
+        self.set_font(style='B', size=self._table_header_font_size)
+        self.cell(h=self._table_header_height, new_x='LEFT', new_y='NEXT', text=f"Scan Data")
+        self.set_font(size=self._table_font_size)
+        l_margin = self.l_margin 
+        self.l_margin = self.x # Temp move to set table location. Probably bad
+        with self.table(
+                first_row_as_headings=False,
+                line_height=self._table_cell_height,
+                col_widths=self._scan_table_cols_rc,
+                width=self._scan_table_width,
+                align='L',
+                text_align='LEFT'
+                ) as table:
+            for i in range(len(table_labels)):
+                row = table.row()
+                row.cell(table_labels[i])
+                row.cell(table_values[i])
+            table_width = table._width
+        self.set_xy(self.x + table_width, reset_y)
+        self.l_margin = l_margin # Reset left margin
+        max_width = self.w - self.r_margin - self.x - 1.5
+
+        images, max_widths = [], []
+        if 'nano_vlm' in all_dets:
+            fig = self._get_vlm_plot(bs_run,
+                                     max_width=max_width)
+            images.append(self._figure_to_image(fig))
+            max_widths.append(max_width)
+
+        # Load AD Data
+        for det in roi_dets:
+            data, roi_str = self._load_and_process_ad_data(bs_run,
+                                                           'primary',
+                                                           det,
+                                                           None,
+                                                           max_axes=(0, 1))
+            
+            clims = [np.mean(data) - 2 * np.std(data), np.mean(data) + 2 * np.std(data)]
+            if clims[0] < 0:
+                clims[0] = 0
+
+            # Plot_data
+            figsize = [max_width / 15, self._max_height / 15]
+            fig, ax = plt.subplots(figsize=figsize, layout='tight', dpi=200)
+            fontsize = 12
+
+            im = ax.imshow(data, vmin=clims[0], vmax=clims[1])
+            divider = make_axes_locatable(ax)
+            cax = divider.append_axes("right", size=0.1, pad=0.1)
+            cbar = fig.colorbar(im, cax=cax)
+            cbar.ax.tick_params(labelsize=fontsize)
+            ax.set_aspect('equal')
+            ax.set_aspect('equal')
+            ax.tick_params(axis='x', labelbottom=False)
+            ax.tick_params(axis='y', labelleft=False)  
+            ax.set_xlabel("image x", fontsize=fontsize)
+            ax.set_ylabel("image y", fontsize=fontsize)
+            ax.set_title(f"Scan {bs_run.start['scan_id']}\n{roi_str}", fontsize=fontsize, pad=5)
+
+            images.append(self._figure_to_image(fig))
+            max_widths.append(max_width)
+
+        # Draw images
+        self.draw_images(images,
+                         max_widths,
+                         self._max_height)
+    
+
+    ### Standardized Plotting ###
+    
+    def _get_vlm_plot(self,
+                      bs_run,
+                      max_height=None,
+                      max_width=None,
+                      scale=0.345 # um / px
+                      ):
+        
+        if max_height is None:
+            max_height = self._max_height
+
+        # Get the data
+        data = bs_run['camera_snapshot']['data']['nano_vlm_image'][:].squeeze()[0]
+        marker = tuple([bs_run.start['scan']['detectors']['nano_vlm'][f'cross_position_{a}'] for a in ['x', 'y']])
+        title=f"Scan {bs_run.start['scan_id']}\nVLM Snapshot"
+
+        figsize = [max_width / 15, max_height / 15]
+        fig, ax = plt.subplots(figsize=figsize, layout='tight', dpi=200)
+        fontsize = 12
+
+        # Add image
+        # clims = (np.min(data), np.min([np.max(data), 1e4]))
+        clims = [np.mean(data) - 2 * np.std(data), np.mean(data) + 2 * np.std(data)]
+        if clims[0] < 0:
+            clims[0] = 0
+
+        im = ax.imshow(data, cmap='gray', vmin=clims[0], vmax=clims[1])
+    
+        # Add marker
+        if not all([m is None for m in marker]):
+            ax.scatter(*marker, marker='+', lw=2, s=100, c='r')
+
+        # Format scalbar
+        scalebar = ScaleBar(0.345, # Example: 1 pixel = 0.2 microns
+                            'um',
+                            fixed_value=100,
+                            color='r',
+                            box_alpha=0,
+                            width_fraction=0.02,
+                            font_properties={'size' : fontsize},
+                            location='lower right') 
+        ax.add_artist(scalebar)
+        
+        # Format axes
+        ax.set_aspect('equal')
+        ax.tick_params(axis='x', labelbottom=False)
+        ax.tick_params(axis='y', labelleft=False)  
+        ax.set_xlabel("x-axis", fontsize=fontsize)
+        ax.set_ylabel("y-axis", fontsize=fontsize)
+        ax.set_title(title, fontsize=fontsize, pad=5)
+                    
+        return fig
+
+    
+    def _get_xrf_map_plot(self,
+                          bs_run,
+                          scan_args,
+                          roi,
+                          roi_label,
+                          transposed,
+                          sclr,
+                          sclr_key,
+                          full_motors,
+                          motor_units,
+                          energy=None,
+                          **kwargs):
+
+        # Load data around ROI
+        if bs_run.start['scan']['type'].split('_')[-1].lower() == 'fly':
+            data = np.sum(bs_run['stream0']['data']['xs_fluor'][..., :7, roi], axis=(-2, -1,), dtype=np.float32)
+        else:
+            data = self._load_and_reshape_step_data(bs_run, roi)
+
+        data /= sclr
+        clims = [np.min(data), np.max(data)]
+        en_int = energy[roi]
+        roi_str = f"{roi_label}: {int(en_int[0])} - {int(en_int[-1])} eV"
+
+        fig = self._get_mapped_plot(bs_run,
+                                    scan_args,
+                                    data,
+                                    transposed,
+                                    title=f"Scan {bs_run.start['scan_id']}\n{roi_str}",
+                                    int_label='Normalized Intensity [a.u.]',
+                                    y_label=f"{full_motors[1]} [{motor_units[1]}]",
+                                    x_label=f"{full_motors[0]} [{motor_units[0]}]",
+                                    **kwargs)
+
+        return fig
+
+    
+    def _get_sclr_map_plot(self,
+                           bs_run,
+                           scan_args,
+                           roi,
+                           roi_label,
+                           transposed,
+                           sclr,
+                           sclr_key,
+                           full_motors,
+                           motor_units,
+                           **kwargs):
+
+        if bs_run.start['scan']['type'].split('_')[-1].lower() == 'fly':
+            data = bs_run['stream0']['data'][roi][:].astype(np.float32)
+        else:
+            data = self._load_and_reshape_step_data(bs_run, roi)
+        if roi != sclr_key: # Normalize if not plotting the normalization
+            data /= sclr
+            int_label = 'Normalized Intensity [a.u.]'
+        else:
+            int_label = 'Intensity [a.u.]'
+        roi_str = f"Scaler: {roi_labels[roi_ind]}"
+
+        fig = self._get_mapped_plot(bs_run,
+                                    scan_args,
+                                    data,
+                                    transposed,
+                                    title=f"Scan {bs_run.start['scan_id']}\n{roi_str}",
+                                    int_label=int_label,
+                                    y_label=f"{full_motors[1]} [{motor_units[1]}]",
+                                    x_label=f"{full_motors[0]} [{motor_units[0]}]",
+                                    **kwargs)
+
+        return fig
+
+
+    def _get_ad_map_plot(self,
+                         bs_run,
+                         scan_args,
+                         roi,
+                         roi_label,
+                         transposed,
+                         sclr,
+                         sclr_key,
+                         full_motors,
+                         motor_units,
+                         **kwargs):
+        
+        # Load Data
+        if bs_run.start['scan']['type'].split('_')[-1].lower() == 'fly':
+            data, roi_str = self._load_and_process_ad_data(bs_run,
+                                                           'stream0',
+                                                            roi,
+                                                            sclr)
+        else:
+            data = self._load_and_reshape_step_data(bs_run, roi)
+            roi_str = f'{roi}_max'
+
+        if data is None:
+            return None
+
+        # Get mapped plot
+        fig = self._get_mapped_plot(bs_run,
+                                    scan_args,
+                                    data,
+                                    transposed,
+                                    title=f"Scan {bs_run.start['scan_id']}\n{roi_str}",
+                                    int_label='Normalized Intensity [a.u.]',
+                                    y_label=f"{full_motors[1]} [{motor_units[1]}]",
+                                    x_label=f"{full_motors[0]} [{motor_units[0]}]",
+                                    **kwargs)
+
+        return fig
+    
+
+    def _get_mapped_plot(self,
+                         bs_run,
+                         scan_args,
+                         data,
+                         transposed,
+                         colornorm='linear',
+                         title=None,
+                         int_label=None,
+                         y_label=None,
+                         x_label=None,
+                         max_height=None,
+                         max_width=None,
+                         ):
+
+        if max_height is None:
+            max_height = self._max_height
+
+        # Parsing data shapes
+        start_shape = tuple([int(s) for s in bs_run.start['scan']['shape']])[::-1]
+        # 1D data is fine
+        if 1 in data.shape:
+            pass
+        else:
+            # Fly in y, transponsed data
+            if transposed:
+                data = data.T
+                start_shape = start_shape[::-1]
+                # Is the data complete?
+                if start_shape != data.shape:
+                    full_data = np.zeros(start_shape)
+                    full_data[:] = np.nan
+                    for i in range(data.shape[1]):
+                        full_data[:, i] = data[:, i]
+                    data = full_data
+            else: # Fly in x
+                # Is the data complete?
+                if start_shape != data.shape:
+                    full_data = np.zeros(start_shape)
+                    full_data[:] = np.nan
+                    for i in range(data.shape[0]):
+                        full_data[i] = data[i]
+                    data = full_data
+        
+        # Generate plot
+        figsize = [max_width / 15, max_height / 15]
+        fig, ax = plt.subplots(figsize=figsize, layout='tight', dpi=200)
+        fontsize = 12
+        if bs_run.start['scan']['type'].split('_')[-1].lower() == 'fly':
+            steps = [(scan_args[i + 1] - scan_args[i + 0]) / (scan_args[i + 2] - 1) for i in [0, 3]]
+        else:
+            steps = [scan_args[2], scan_args[5]]
+        if 1 in data.shape: # Plot plot
+            if steps[0] != 0:
+                ax.plot(np.linspace(*scan_args[:2], int(scan_args[2])), data.squeeze())
+            else:
+                ax.plot(np.linspace(*scan_args[3:5], int(scan_args[5])), data.squeeze())
+            ax.ticklabel_format(axis='y', style='sci', scilimits=(-2, 2))
+            ax.set_ylabel(int_label, fontsize=fontsize)
+        else: # Plot image
+            extent = [scan_args[0] - steps[0] / 2,
+                      scan_args[1] + steps[0] / 2,
+                      scan_args[4] + steps[1] / 2,
+                      scan_args[3] - steps[1] / 2]
+            clims = [np.min(data), np.max(data)]
+
+            # Change colorscale
+            if colornorm == 'log':
+                log_min = 1 / np.max(sclr)
+                if 'dexela' in title:
+                    log_min *= 1e2
+                data[data <= 0] = log_min
+                clims[0] = log_min
+
+            im = ax.imshow(data, extent=extent, norm=colornorm, vmin=clims[0], vmax=clims[1])
+            divider = make_axes_locatable(ax)
+            cax = divider.append_axes("right", size=0.1, pad=0.1)
+            cbar = fig.colorbar(im, cax=cax)
+            if colornorm == 'linear':
+                cbar.formatter.set_powerlimits((-2, 2))
+            cbar.ax.tick_params(labelsize=fontsize)
+            ax.set_aspect('equal')
+            ax.set_ylabel(y_label, fontsize=fontsize)
+        ax.tick_params(axis='both', labelsize=fontsize)
+        ax.set_xlabel(x_label, fontsize=fontsize)
+        ax.set_title(title, fontsize=fontsize, pad=15)
+        
+        return fig
+
+
+    def _get_line_plot(self,
+                       x, # array([[x0, x1, ...]])
+                       y, # array([[y0, y1, ...]])
+                       marker=False, # array([[x0, y0], [x1, y1], ...])
+                       title=None,
+                       labels=None, # [label0, label1, ...]
+                       y_label=None,
+                       x_label=None,
+                       max_height=None,
+                       max_width=None,
+                       ):
+        
+        fig, ax = plt.subplots(figsize=(max_width / 15, max_height / 15), tight_layout=True, dpi=200)
+        fontsize=12
+        plot_legend = True
+        if labels is None:
+            plot_legend = False
+            labels = [None,] * len(x)
+        ax.plot(np.asarray(x).T, np.asarray(y).T, label=labels)
+        ax.ticklabel_format(axis='y', style='sci', scilimits=(-2, 2))
+        ax.set_ylabel(y_label, fontsize=fontsize)
+        ax.set_xlabel(x_label, fontsize=fontsize)
+        ax.tick_params(axis='both', labelsize=fontsize)
+        ax.set_title(title, fontsize=fontsize, pad=5)
+
+        if marker:
+            ax.scatter(*np.asarray(marker).T, marker='*', s=50, c='r')
+        if plot_legend:
+            ax.legend()
+
+        return fig
+    
+
+    def _load_and_reshape_step_data(self,
+                                    bs_run,
+                                    roi):
+        # Probably overkill ensuring the pixel grid is correct
+        data = np.zeros(bs_run.start['scan']['shape'][::-1]) # must be reversed for [y, x]
+        data[:] = np.nan # For unfinished plotting purposes
+
+        if isinstance(roi, slice):
+            flat_data = np.asarray([bs_run['primary']['data'][f'xs_channel0{ind + 1}_fluor'][..., roi] for ind in range(7)],
+                                    dtype=np.float32).sum(axis=(0, -1))
+        elif 'image' in roi:
+            # Untested as of 2025-08-27 due to handler errors 
+            flat_data = np.asarray(bs_run['primary']['data'][roi], dtype=float).squeez().max(axis=(-2, -1))
+        else:
+            flat_data = np.asarray(bs_run['primary']['data'][roi], dtype=float)
+        flat_x = bs_run['primary']['data'][bs_run.start['scan']['fast_axis']['motor_name']][:]
+        flat_y = bs_run['primary']['data'][bs_run.start['scan']['slow_axis']['motor_name']][:]
+        grid_x = np.linspace(*bs_run.start['scan']['scan_input'][0:2], data.shape[1])
+        grid_y = np.linspace(*bs_run.start['scan']['scan_input'][3:5], data.shape[0])
+        
+        for x, y, d in zip(flat_x, flat_y, flat_data):
+            ind_x = np.argmin(np.abs(x - grid_x))
+            ind_y = np.argmin(np.abs(y - grid_y))
+            data[ind_y, ind_x] = d
+        
+        return data
+    
+    def _load_and_process_ad_data(self,
+                                  bs_run,
+                                  stream_name,
+                                  roi,
+                                  sclr,
+                                  max_axes=(-2, -1)
+                                  ):
+
+        # Check for data
+        if f'{roi}_image' not in bs_run[stream_name]['data']:
+            warn_str = (f"WARNING: Key not in '{stream_name}' for "
+                        + f"{roi} data from scan "
+                        + f"{bs_run.start['scan_id']}. Proceding "
+                        + "without changes.")
+            print(warn_str)
+            return None, ''
+
+        # Load dark-field if there
+        if 'dark' in bs_run:
+            # Assume that this will always work for now...
+            dark = bs_run['dark']['data'][f'{roi}_image'][:].astype(np.float32)
+            dark = np.median(dark.squeeze(), axis=0)
+        else:
+            dark = None
+        
+        scan_type = bs_run.start['scan']['type']     
+
+        try:
+            # Manual load data of fly-scanning map
+            if scan_type == 'XRF_FLY':
+                # Pseudo binning
+                # Saves memory, but at the cost of time
+                data_shape = bs_run[stream_name]['data'][f'{roi}_image'].shape
+                data_slicing = tuple([slice(None), slice(None)]
+                                    + [slice(None, None, int(s / 500) + 1)
+                                       for s in data_shape[-2:]]) 
+
+                data = manual_load_data(int(bs_run.start['scan_id']),
+                                        data_keys=[f'{roi}_image'],
+                                        repair_method='fill',
+                                        verbose=False)[0][f'{roi}_image']
+                data = np.asarray([d[data_slicing[1:]] for d in data]).astype(np.float32)
+                if dark is not None:
+                    dark = dark[data_slicing[-2:]]
+
+            # Manual load data of step-scanning rocking curve
+            elif scan_type in ['ANGLE_RC', 'ENERGY_RC']:
+                data = load_step_rc_data(int(bs_run.start['scan_id']), verbose=False)
+                data = np.asarray(data[0][f'{roi}_image'], dtype=np.float32)
+            
+            # Don't know an hope tiled works
+            else:
+                data = bs_run[stream_name]['data'][f'{roi}_image'][:].astype(np.float32)
+
+            # Process data
+            null_map = np.all(data == 0, axis=max_axes)
+            if dark is None:
+                dark = np.min(data[~null_map], axis=0) # approximate
+            data -= dark
+            data = median_filter(data, size=(1, 1, 2, 2)) # Denoise. Also takes a long time
+            data = np.max(data, axis=max_axes)
+            if sclr is not None:
+                data /= sclr
+            data[null_map] = 0
+            roi_str = f'{roi}_max'
+        
+        except Exception as e:
+            err_str = (f"{e}: Error loading {roi} "
+                        + f"from scan {bs_run.start['scan_id']}. "
+                        + f"Proceding without changes.")
+            print(err_str)
+            data = None
+            roi_str = ''
+        
+        return data, roi_str
+
+
+    ### Drawing Images from Figures ###
+
+    def draw_images(self, images, max_widths, max_height):
+        
+        # Record current position
+        reset_y = self.y
+
+        if len(images) == 0:
+            image_ind = -1
+
+        # Iterate through images       
+        for image_ind, (image, width) in enumerate(zip(images, max_widths)):
+
+            # if (image_ind - 1) % 3 in [1, 2]:
+            #     width = np.min([width, self.epw / 3])
+
+            # Determine image size which best fills available space
+            width_at_max_height = (image.width / image.height) * max_height
+            if width_at_max_height > width:
+                image_height = width * (image.height / image.width)
+                image_width = width
+            else:
+                image_height = max_height
+                image_width = (image.width / image.height) * max_height
+
+            # Plot with tables
+            if image_ind == 0:
+                if self._verbose:
+                    print(f'Drawing image {image_ind} at first index.') 
+                image_x = self.x + ((self.w - self.r_margin) - self.x - image_width) / 2
+                self.image(image, x=image_x, h=image_height, keep_aspect_ratio=True)
+                # Start new line of images
+                self.set_xy(self.l_margin, reset_y + self._max_height + self._offset_height)
+                reset_y = self.y
+
+            # Plot left of three
+            elif (image_ind - 1) % 3 == 0:
+                if self._verbose:
+                    print(f'Drawing image {image_ind} at on left.') 
+                image_x = self.l_margin
+                self.image(image, x=image_x, h=image_height, keep_aspect_ratio=True)
+                self.set_xy(self.l_margin, reset_y)
+
+            # Plot middle of three
+            elif (image_ind - 1) % 3 == 1:
+                if self._verbose:
+                    print(f'Drawing image {image_ind} at at center.') 
+                image_x = (self.w - image_width) / 2
+                self.image(image, x=image_x, h=image_height, keep_aspect_ratio=True)
+                self.set_xy(self.l_margin, reset_y)
+
+            # Plot right of three    
+            elif (image_ind - 1) % 3 == 2:
+                if self._verbose:
+                    print(f'Drawing image {image_ind} at on right.') 
+                image_x = self.w - self.r_margin - image_width
+                self.image(image, x=image_x, h=image_height, keep_aspect_ratio=True)
+                # Start new line of images
+                self.set_xy(self.l_margin, reset_y + self._max_height + self._offset_height)
+                reset_y = self.y
+        
+        # Cleanup
+        if image_ind == 0 or (image_ind - 1) % 3 == 2:
+            self.set_xy(self.l_margin, self.y + 0.5)
+            if self._verbose:
+                print(f'First cleanup call after drawing first or last image.')
+        else:
+            self.set_xy(self.l_margin, self.y + self._max_height + self._gap_height)
+            if self._verbose:
+                print('Second cleanup call after drawing other images or none.') 
+    
+
+    def _figure_to_image(self, figure):
 
         # Converting Figure to an image:
-        canvas = FigureCanvas(fig)
+        canvas = FigureCanvas(figure)
         canvas.draw()
-        pdf_img = Image.fromarray(np.asarray(canvas.buffer_rgba()))
-        plt.close(fig)
-
-        width_at_max_height = (pdf_img.width / pdf_img.height) * max_height
-        if width_at_max_height > max_width:
-            img_height = max_width * (pdf_img.height / pdf_img.width)
-            img_width = max_width
-        else:
-            img_height = max_height
-            img_width = (pdf_img.width / pdf_img.height) * img_height
+        image = Image.fromarray(np.asarray(canvas.buffer_rgba()))
+        plt.close(figure)
         
-        return pdf_img, img_height, img_width
+        return image
     
 
     ### Extract information from tiled ###
@@ -1489,8 +1991,8 @@ class SRXScanPDF(FPDF):
             
         return UPDATED_EXP_MD
 
-    def _get_start_scan_data(self,
-                             bs_run):
+    def get_start_scan_data(self,
+                            bs_run):
         """Get metadata from start document."""
         
         scan_meta_data = {}
@@ -1535,8 +2037,8 @@ class SRXScanPDF(FPDF):
         return scan_meta_data
     
 
-    def _get_baseline_scan_data(self,
-                                bs_run):
+    def get_baseline_scan_data(self,
+                               bs_run):
         """Get reference data from baseline"""
         scan_base_data = {}
 
@@ -1795,7 +2297,7 @@ def generate_scan_report(start_id=None,
 
     # Parse kwargs to make sure they are useful. Add functions and methods as necessary
     useful_kwargs = (list(get_kwargs(SRXScanPDF.add_scan))
-                     + list(get_kwargs(SRXScanPDF.add_XRF_FLY))
+                     + list(get_kwargs(SRXScanPDF._add_xrf_general))
                      + list(get_kwargs(_find_xrf_rois)))
     for key in kwargs.keys():
         if key not in useful_kwargs:
@@ -1878,7 +2380,8 @@ def generate_scan_report(start_id=None,
             raise ValueError(err_str)
     current_id = start_id # Create current_id as counter
 
-    print(f'Final end_id is {end_id}')
+    if verbose:
+        print(f'Final end_id is {end_id}')
     
     # Setup file paths
     if 'scan_report' not in wd: # Lacking the 's' for generizability
@@ -1906,7 +2409,8 @@ def generate_scan_report(start_id=None,
             pdf_md = json.load(f)
         current_id = pdf_md['current_id']
     
-    print(f'PDF path is: {pdf_path}')
+    if verbose:
+        print(f'PDF path is: {pdf_path}')
     
     # Move to continuous writing
     while True:
@@ -1972,7 +2476,7 @@ def generate_scan_report(start_id=None,
                 scan_report.add_page()
 
                 # Update md
-                pdf_md = {'current_id' : current_id,
+                pdf_md = {'current_id' : current_id + 1,
                           'abscissa' : (scan_report.x, scan_report.y)}
 
                 # Write data
@@ -1998,7 +2502,7 @@ def generate_scan_report(start_id=None,
             # Add new scan
             scan_report.add_scan(current_id, **kwargs)
             # Update md
-            pdf_md = {'current_id' : current_id,
+            pdf_md = {'current_id' : current_id + 1,
                       'abscissa' : (scan_report.x, scan_report.y)}
 
             # Overlay first page of new pdf to last page of previous
