@@ -70,7 +70,7 @@ def _find_xrf_rois(xrf,
                    min_roi_num=0,
                    max_roi_num=25, # Hard capping for too many elements
                    log_prominence=1,
-                   energy_tolerance=50,
+                   energy_tolerance=60, # What is good value for this? About half energy resolution right now.
                    esc_en=1740,
                    snr_cutoff=100,
                    scan_kwargs={},
@@ -244,27 +244,33 @@ def _find_xrf_rois(xrf,
         rois, roi_labels = [], []
         for el in found_elements:
             # Add specified lines first
-            if el.sym in [line.split('_')[0] for line in specific_lines]:
-                line = specific_lines[[line.split('_')[0] for line in specific_lines].index(el.sym)].split('_')[-1]
-                line_en = el.emission_line[line] * 1e3
-                rois.append(slice(int((line_en / en_step) - (100 / en_step)), int((line_en / en_step) + (100 / en_step))))
-                roi_labels.append(f'{el.sym}_{line}')
-                if verbose:
-                    print(f'Specified element ({el.sym}) with line ({line}) added.')
-                continue
+            if isinstance(el, xrfC.XrfElement):
+                if el.sym in [line.split('_')[0] for line in specific_lines]:
+                    line = specific_lines[[line.split('_')[0] for line in specific_lines].index(el.sym)].split('_')[-1]
+                    line_en = el.emission_line[line] * 1e3
+                    rois.append(slice(int((line_en / en_step) - (100 / en_step)), int((line_en / en_step) + (100 / en_step))))
+                    roi_labels.append(f'{el.sym}_{line}')
+                    if verbose:
+                        print(f'Specified element ({el.sym}) with line ({line}) added.')
+                    continue
+                
+                # Ignore argon mostly
+                elif el.sym in boring_elements:
+                    if verbose:
+                        print(f'Found element {el.sym}, but it is too boring to generate ROI!') 
+                    continue            
 
-            if isinstance(el, int):
+            elif isinstance(el, int):
                 if verbose:
                     print(f'Found unknown ROI around {el} eV.')
                 rois.append(slice(int((el / en_step) - (100 / en_step)), int((el / en_step) + (100 / en_step))))
                 roi_labels.append('Unknown')
                 continue
             
-            # Ignore argon mostly
-            elif el.sym in boring_elements:
-                if verbose:
-                    print(f'Found element {el.sym}, but it is too boring to generate ROI!') 
-                continue
+            # Something bad happened
+            else:
+                print('WARNING: Weird element found in XRF ROIs. Moving on, but something is very wrong.')
+            
 
             if verbose:
                 print(f'Found element {el.sym}! Generating ROI around highest yield fluorescence line.')    
@@ -1088,6 +1094,8 @@ class SRXScanPDF(FPDF):
             en_steps = scan_inputs[1][1:-1].split(' ') # should already be in eV
             en_range = np.max(en_inputs) - np.min(en_inputs)
             nom_energy = [float(en) for en in scan['energy']] # No better way to get number of points?
+            en_start = en_inputs[0]
+            en_end = en_inputs[-1]
 
             table_values = [',\n'.join([str(en) for en in en_inputs]),
                             ', '.join([str(en) for en in en_steps]),
@@ -1126,37 +1134,112 @@ class SRXScanPDF(FPDF):
                 if fig is not None:
                     images.append(self._figure_to_image(fig))
                     max_widths.append(self._max_plot_width)
+            
+            red_edges_mask = ((np.asarray(all_edges) > en_start)
+                             & (np.asarray(all_edges) < en_end))
+            red_edges_names = [name for b, name in zip(red_edges_mask, all_edges_names) if b]
+            red_edges = [edge for b, edge in zip(red_edges_mask, all_edges) if b]
+            en_step = 10 # Hard-coded for now
 
             # XAS      
+            # if 'roi_names' in scan:
+            #     roi_label = scan['roi_names'][int(scan['roi_num']) - 1]
+            # elif ('detectors' in scan
+            #       and isinstance(scan['detectors'], dict)):
+            #     roi_label = scan['detectors']['xs']['roi1']
+            # else:
+            #     roi_label = 'Unknown'
+            roi_label = None
             if 'roi_names' in scan:
-                roi_label = scan['roi_names'][int(scan['roi_num']) - 1]
+                roi_labels = scan['roi_names']
             elif ('detectors' in scan
                   and isinstance(scan['detectors'], dict)):
-                roi_label = scan['detectors']['xs']['roi1']
+                roi_labels = scan['detectors']['xs'].values()
             else:
-                roi_label = 'Unknown'
+                roi_labels = ['Unknown']
+                roi_label = roi_labels[0]
+            
+            # Find best label. Should be first, but users can make mistakes
+            if roi_label is None:
+                if self._verbose:
+                    print('Using ROI from scan metadata for XAS plotting.')
+                roi_labels = [label for label in roi_labels if label != '']
+                # Use first specified label with edge in energy range
+                for label in roi_labels:
+                    el, line = label.split('_')
+                    for edge_name in red_edges_names:
+                        if el == edge_name.split('_')[0]:
+                            roi_label = edge_name
+                            line_en = xrfC.XrfElement(el).emission_line[line] * 1e3
+                            roi = slice(int((line_en / en_step) - (100 / en_step)),
+                                        int((line_en / en_step) + (100 / en_step)))
+                            break
+                    else:
+                        continue
+                    break
+                # Otherwise pull from XRF
+                else:
+                    if self._verbose:
+                        print('Cannot find XAS ROI in scan metadata. Guessing for XRF spectrum.')
+                    if (scan_type == 'fly' and any(['scan' in key for key in bs_run.keys()])):
+                        stream_names = [key for key in bs_run.keys() if 'scan' in key]
+                        xrf_sum = np.sum([bs_run[stream_names[0]]['data'][f'xs_id_mono_fly_channel0{ind + 1}'][..., :2500] for ind in range(7)], axis=(0, 1))
+                    else:
+                        xrf_sum = np.sum([bs_run['primary']['data'][f'xs_channel0{i + 1}_fluor'][..., :2500] for i in range(7)], axis=(0, 1))
+                    
+                    xs_roi = _find_xrf_rois(xrf_sum,
+                                            np.arange(0, len(xrf_sum)) * en_step,
+                                            en_end)
+                    
+                    for roi, roi_label in zip(*xs_roi):
+                        el, line = roi_label.split('_')
+                        for edge_name in red_edges_names:
+                            if el == edge_name.split('_'):
+                                break
+                    # Give up
+                    else:
+                        if self._verbose:
+                            print('Failed to find ROI from XRF spectrum. ROI fitting will be bad.')
+                        if len(red_edges) > 0:
+                            roi_label = red_edges_names[0]
+                            roi = int(np.round(red_edges[0] / 1e3))
+                        elif len(roi_labels) > 0:
+                            roi_label = roi_labels[0]
+                            el, line = roi_label.split('_')
+                            line_en = xrfC.XrfElement(el).emission_line[line] * 1e3
+                            roi = slice(int((line_en / en_step) - (100 / en_step)),
+                                        int((line_en / en_step) + (100 / en_step)))
+                        else:
+                            # No idea, try everything...
+                            roi_label = 'Total XRF'
+                            roi = slice(20, 2500)
 
-            if roi_label != 'Unknown':
-                el, line = roi_label.split('_')
-                line_en = xrfC.XrfElement(el).emission_line[line] * 1e3
-                en_step = 10 # Hard-coded for now
-                roi = slice(int((line_en / en_step) - (100 / en_step)), int((line_en / en_step) + (100 / en_step)))
+            # if roi_label != 'Unknown':
+            #     el, line = roi_label.split('_')
+            #     line_en = xrfC.XrfElement(el).emission_line[line] * 1e3
+            #     en_step = 10 # Hard-coded for now
+            #     roi = slice(int((line_en / en_step) - (100 / en_step)),
+            #                 int((line_en / en_step) + (100 / en_step)))
 
-                # Reduce possible edges...
-                red_edges_mask = [el in name for name in all_edges_names]
-                red_edges_names = [name for b, name in zip(red_edges_mask, all_edges_names) if b]
-                red_edges = [edge for b, edge in zip(red_edges_mask, all_edges) if b]
-            else:
-                red_edges_names = all_edges_names.copy()
-                red_edges = all_edges.copy()
+            #     # Reduce possible edges...
+            #     red_edges_mask = [el in name for name in all_edges_names]
+            #     red_edges_names = [name for b, name in zip(red_edges_mask, all_edges_names) if b]
+            #     red_edges = [edge for b, edge in zip(red_edges_mask, all_edges) if b]
+            # else:
+            #     red_edges_names = all_edges_names.copy()
+            #     red_edges = all_edges.copy()
 
             # Load data
+            # TODO: Allow for multiple edges with XAS_FLY?
             data = None
             if scan_type == 'step' and 'primary' in bs_run:
                 en = bs_run['primary']['data']['energy_energy'][:].astype(np.float32)
                 if en[0] < 1e3:
                     en *= 1e3
-                data = np.sum([bs_run['primary']['data'][f'xs_channel0{i + 1}_mcaroi01_total_rbv'][:] for i in range(7)], axis=0, dtype=np.float32)
+                if roi_label == roi_labels[0]:
+                    data = np.sum([bs_run['primary']['data'][f'xs_channel0{i + 1}_mcaroi01_total_rbv'][:] for i in range(7)], axis=0, dtype=np.float32)
+                else: 
+                    data = np.sum([bs_run['primary']['data'][f'xs_channel0{i + 1}_fluor'][..., roi] for i in range(7)], axis=(0, -1))
                 data /= bs_run['primary']['data']['sclr_i0'][:].astype(np.float32)
                 edge_ind = np.argmax(np.gradient(data, en))
                 el_edge = red_edges_names[np.argmin(np.abs(np.array(red_edges) - en[edge_ind]))]
