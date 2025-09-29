@@ -113,13 +113,19 @@ def _find_xrf_rois(xrf,
         if specific_elements is not None:
             for el in specific_elements:
                 # print(f'{el} in specific elements')
-                if (isinstance(el, str)
-                    and el.split('_')[0].capitalize() in possible_elements):
-                    # Add check to see if the element name has been repeated
-                    # print(f'{el} added to found elements')
-                    found_elements.append(xrfC.XrfElement(el.split('_')[0].capitalize()))
-                    specific_lines.append(el)
-                    num_interesting_rois += 1
+                line = None
+                if '_' in el:
+                    el, line = el.split('_')
+                el = el.capitalize()
+                if el in possible_elements:
+                    if line is not None:
+                        found_elements.append(xrfC.XrfElement(el))
+                        specific_lines.append('_'.join([el, line]))
+                        num_interesting_rois += 1
+                    else:
+                        if xrfC.XrfElement(el) not in found_elements:
+                            found_elements.append(xrfC.XrfElement(el))
+                            num_interesting_rois += 1
 
         # Convert energy to eV
         if energy[int((len(energy) - 1) / 2)] < 1e3:
@@ -966,7 +972,7 @@ class SRXScanPDF(FPDF):
                 elif roi in ['merlin', 'dexela']:
                     plot_func = lambda *a, **k : self._get_ad_map_plot(*a, **k)
                 # Scaler or XBIC
-                elif rois[roi_ind] in [str(s).lower() for s in scaler_rois]:
+                elif roi in [str(s).lower() for s in scaler_rois]:
                     plot_func = lambda *a, **k : self._get_sclr_map_plot(*a, **k)
                 # Unknown
                 else:
@@ -1093,7 +1099,16 @@ class SRXScanPDF(FPDF):
                 en_inputs = [en * 1e3 for en in en_inputs]
             en_steps = scan_inputs[1][1:-1].split(' ') # should already be in eV
             en_range = np.max(en_inputs) - np.min(en_inputs)
-            nom_energy = [float(en) for en in scan['energy']] # No better way to get number of points?
+
+            # Get energy points. Taken for xanes_plan directly
+            ept = np.array([])
+            erange = np.array(en_inputs)
+            estep = np.array([float(step) for step in en_steps])
+            # Calculation for the energy points
+            for i in range(len(estep)):
+                ept = np.append(ept, np.arange(erange[i], erange[i+1], estep[i]))
+            ept = np.append(ept, np.array(erange[-1]))
+            
             en_start = en_inputs[0]
             en_end = en_inputs[-1]
 
@@ -1101,7 +1116,7 @@ class SRXScanPDF(FPDF):
                             ', '.join([str(en) for en in en_steps]),
                             ', '.join(useful_dets),
                             f"{scan['dwell']} sec",
-                            str(len(nom_energy)),
+                            str(len(ept)),
                             f"{en_range} eV"
                             ]
 
@@ -1239,7 +1254,7 @@ class SRXScanPDF(FPDF):
                 if roi_label == roi_labels[0]:
                     data = np.sum([bs_run['primary']['data'][f'xs_channel0{i + 1}_mcaroi01_total_rbv'][:] for i in range(7)], axis=0, dtype=np.float32)
                 else: 
-                    data = np.sum([bs_run['primary']['data'][f'xs_channel0{i + 1}_fluor'][..., roi] for i in range(7)], axis=(0, -1))
+                    data = np.sum([bs_run['primary']['data'][f'xs_channel0{i + 1}_fluor'][..., roi] for i in range(7)], axis=(0, -1), dtype=np.float32)
                 data /= bs_run['primary']['data']['sclr_i0'][:].astype(np.float32)
                 edge_ind = np.argmax(np.gradient(data, en))
                 el_edge = red_edges_names[np.argmin(np.abs(np.array(red_edges) - en[edge_ind]))]
@@ -1715,7 +1730,7 @@ class SRXScanPDF(FPDF):
             int_label = 'Normalized Intensity [a.u.]'
         else:
             int_label = 'Intensity [a.u.]'
-        roi_str = f"Scaler: {roi_labels[roi_ind]}"
+        roi_str = f"Scaler: {roi_label}"
 
         fig = self._get_mapped_plot(bs_run,
                                     scan_args,
@@ -2068,7 +2083,7 @@ class SRXScanPDF(FPDF):
             # Plot left of three
             elif (image_ind - 1) % 3 == 0:
                 if self._verbose:
-                    print(f'Drawing image {image_ind} at on left.') 
+                    print(f'Drawing image {image_ind} on left.') 
                 image_x = self.l_margin
                 self.image(image, x=image_x, h=image_height, keep_aspect_ratio=True)
                 self.set_xy(self.l_margin, reset_y)
@@ -2076,7 +2091,7 @@ class SRXScanPDF(FPDF):
             # Plot middle of three
             elif (image_ind - 1) % 3 == 1:
                 if self._verbose:
-                    print(f'Drawing image {image_ind} at at center.') 
+                    print(f'Drawing image {image_ind} at center.') 
                 image_x = (self.w - image_width) / 2
                 self.image(image, x=image_x, h=image_height, keep_aspect_ratio=True)
                 self.set_xy(self.l_margin, reset_y)
@@ -2084,7 +2099,7 @@ class SRXScanPDF(FPDF):
             # Plot right of three    
             elif (image_ind - 1) % 3 == 2:
                 if self._verbose:
-                    print(f'Drawing image {image_ind} at on right.') 
+                    print(f'Drawing image {image_ind} on right.') 
                 image_x = self.w - self.r_margin - image_width
                 self.image(image, x=image_x, h=image_height, keep_aspect_ratio=True)
                 # Start new line of images
@@ -2123,11 +2138,30 @@ class SRXScanPDF(FPDF):
         exp_md = {}
 
         # Add proposal information
-        for key in ['proposal_id', 'title', 'pi_name']:
-            if key in start['proposal']:
-                exp_md[key] = start['proposal'][key]
-            else:
-                exp_md[key] = None
+        # proposal_id
+        if 'proposal_id' in start['proposal']:
+            exp_md['proposal_id'] = start['proposal']['proposal_id']
+        elif 'proposal_num' in start['proposal']:
+            exp_md['proposal_id'] = start['proposal']['proposal_num']
+        else:
+            exp_md['proposal_id'] = None
+        
+        # title
+        if 'title' in start['proposal']:
+            exp_md['title'] = start['proposal']['title']
+        elif 'proposal_title' in start['proposal']:
+            exp_md['title'] = start['proposal']['proposal_title']
+        else:
+            exp_md['title'] = 'TITLE MISSING'
+        
+        # pi_name
+        if 'pi_name' in start['proposal']:
+            exp_md['pi_name'] = start['proposal']['pi_name']
+        elif 'PI_lastname' in start['proposal']:
+            exp_md['pi_name'] = start['proposal']['PI_lastname']
+        else:
+            exp_md['pi_name'] = 'PI NAME MISSING'
+
         # Add cycle
         if 'cycle' in start:
             exp_md['cycle'] = start['cycle']
@@ -2257,8 +2291,11 @@ class SRXScanPDF(FPDF):
         # SDD position value. sdd_dist will be used if available
         if 'nano_det_x' in baseline['data']:
             scan_base_data['sdd_x'] = baseline['data']['nano_det_x'][0]
-            scan_base_data['sdd_dist'] = baseline['data']['nano_det_sample2detector'][0]
             scan_base_data['sdd_x_units'] = baseline['config']['nano_det']['nano_det_x_motor_egu'][0]
+            if 'nano_det_sample2detector' in baseline['data']:
+                scan_base_data['sdd_dist'] = baseline['data']['nano_det_sample2detector'][0]
+            else:
+                scan_base_data['sdd_dist'] = None
         else:
             scan_base_data['sdd_x'] = None
             scan_base_data['sdd_dist'] = None
@@ -2446,12 +2483,13 @@ def generate_scan_report(start_id=None,
     """
 
     # Quick function to get keyword argument names
-    get_kwargs = lambda func : func.__code__.co_varnames[len(func.__defaults__) - 1 : func.__code__.co_argcount]
+    get_kwargs = lambda func : func.__code__.co_varnames[func.__code__.co_argcount - len(func.__defaults__) : func.__code__.co_argcount]
 
     # Parse kwargs to make sure they are useful. Add functions and methods as necessary
     useful_kwargs = (list(get_kwargs(SRXScanPDF.add_scan))
                      + list(get_kwargs(SRXScanPDF._add_xrf_general))
                      + list(get_kwargs(_find_xrf_rois)))
+    useful_kwargs.remove('scan_kwargs')
     for key in kwargs.keys():
         if key not in useful_kwargs:
             err_str = f"generate_scan_report got an unexpected keyword argument '{key}'"
@@ -2467,7 +2505,13 @@ def generate_scan_report(start_id=None,
 
         if start_id in c:
             start_cycle = c[start_id].start['cycle']
-            start_proposal_id = c[start_id].start['proposal']['proposal_id']
+            if 'proposal_id' in c[start_id].start['proposal']:
+                start_proposal_id = c[start_id].start['proposal']['proposal_id']
+            elif 'proposal_num' in c[start_id].start['proposal']:
+                start_proposal_id = c[start_id].start['proposal']['proposal_num']
+            else:
+                err_str = f'Cannot find proposal identification key from start document!'
+                raise ValueError(err_str)
 
             if ((proposal_id is not None and proposal_id != start_proposal_id)
                 or (cycle is not None and cycle != start_cycle)):
