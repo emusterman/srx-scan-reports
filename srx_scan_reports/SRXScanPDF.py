@@ -1,13 +1,8 @@
 import numpy as np
 import time as ttime
-from tqdm import tqdm
-import os
-import io
-import json
 import dask.array as da
 
 from fpdf import FPDF
-from PyPDF2 import PdfReader, PdfWriter, PdfMerger
 
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
@@ -17,284 +12,9 @@ from matplotlib.colors import LogNorm
 import matplotlib.ticker as ticker
 from matplotlib_scalebar.scalebar import ScaleBar
 from PIL import Image
-from scipy.signal import find_peaks
-import skbeam.core.constants.xrf as xrfC
-from itertools import combinations_with_replacement
 from scipy.ndimage import median_filter
-from scipy.stats import mode
 
-from xrdmaptools.io.db_io import (
-    manual_load_data,
-    load_step_rc_data
-)
-
-from tiled.client import from_profile
-from tiled.queries import Key
-
-# Access data
-c = from_profile('srx')
-
-# Get elemental information
-possible_elements = ['Si', 'P', 'S', 'Cl', 'Ar', 'K', 'Ca', 'Sc', 'Ti', 'V',
-                     'Cr', 'Mn', 'Fe', 'Co', 'Ni', 'Cu', 'Zn', 'Ga', 'Ge', 'As',
-                     'Se', 'Br', 'Kr', 'Rb', 'Sr', 'Y', 'Zr', 'Nb', 'Mo', 'Tc',
-                     'Ru', 'Rh', 'Pd', 'Ag', 'Cd', 'In', 'Sn', 'Sb', 'Te', 'I',
-                     'Xe', 'Cs', 'Ba', 'La', 'Ce', 'Pr', 'Nd', 'Pm', 'Sm', 'Eu',
-                     'Gd', 'Tb', 'Dy', 'Ho', 'Er', 'Tm', 'Yb', 'Lu', 'Hf', 'Ta',
-                     'W', 'Re', 'Os', 'Ir', 'Pt', 'Au', 'Hg', 'Tl', 'Pb', 'Bi',
-                     'Po', 'At', 'Rn', 'Fr', 'Ra', 'Ac', 'Th', 'Pa', 'U']
-
-boring_elements = ['Ar']
-
-elements = [xrfC.XrfElement(el) for el in possible_elements]
-edges = ['k', 'l1', 'l2', 'l3']
-# edges = ['k', 'l3']
-lines = ['ka1', 'kb1', 'la1', 'lb1', 'lb2', 'lg1', 'la2', 'lb3', 'lb4', 'll', 'ma1', 'mb']
-major_lines = ['ka1', 'la1', 'lb1', 'ma1']
-roi_lines = ['ka1', 'la1', 'ma1']
-
-all_edges, all_edges_names, all_lines, all_lines_names = [], [], [], []
-for el in elements:
-    for edge in edges:
-        edge_en = el.bind_energy[edge] * 1e3
-        if 4e3 < edge_en < 22e3:
-            all_edges.append(edge_en)
-            all_edges_names.append(f'{el.sym}_{edge.capitalize()}')
-
-# No provisions to handle peak overlaps
-# Also only gives rois for major XRF lines (ka1, la1, ma1)
-def _find_xrf_rois(xrf,
-                   energy,
-                   incident_energy,
-                   specific_elements=None,
-                   min_roi_num=0,
-                   max_roi_num=25, # Hard capping for too many elements
-                   log_prominence=1,
-                   energy_tolerance=60, # What is good value for this? About half energy resolution right now.
-                   esc_en=1740,
-                   snr_cutoff=100,
-                   scan_kwargs={},
-                   verbose=False):
-
-        # Parse out scan_kwargs
-        if 'specific_elements' in scan_kwargs:
-            specific_elements = scan_kwargs.pop('specific_elements')
-        if 'min_roi_num' in scan_kwargs:
-            min_roi_num = scan_kwargs.pop('min_roi_num')
-        if 'max_roi_num' in scan_kwargs:
-            min_roi_num = scan_kwargs.pop('max_roi_num')
-        if 'log_prominence' in scan_kwargs:
-            log_prominence = scan_kwargs.pop('log_prominence')
-        if 'energy_tolerance' in scan_kwargs:
-            energy_tolerance = scan_kwargs.pop('energy_tolerance')
-        if 'esc_en' in scan_kwargs:
-            esc_en = scan_kwargs.pop('esc_en')
-        if 'snr_cutoff' in scan_kwargs:
-            snr_cutoff = scan_kwargs['snr_cutoff']
-        
-        # Verbosity
-        if verbose:
-            print('Finding XRF ROI information.')
-            print(f'{min_roi_num=}')
-            print(f'{max_roi_num=}')
-            print(f'{specific_elements=}')
-
-        # Parse some inputs
-        if min_roi_num > max_roi_num:
-            max_roi_num = min_roi_num
-        
-        # Do not bother if no rois requested
-        if max_roi_num == 0:
-            return [], [], [], []
-
-        # Process specified elements before anything else
-        found_elements, specific_lines  = [], []
-        num_interesting_rois = 0
-        if specific_elements is not None:
-            for el in specific_elements:
-                # print(f'{el} in specific elements')
-                line = None
-                if '_' in el:
-                    el, line = el.split('_')
-                el = el.capitalize()
-                if el in possible_elements:
-                    if line is not None:
-                        found_elements.append(xrfC.XrfElement(el))
-                        specific_lines.append('_'.join([el, line]))
-                        num_interesting_rois += 1
-                    else:
-                        if xrfC.XrfElement(el) not in found_elements:
-                            found_elements.append(xrfC.XrfElement(el))
-                            num_interesting_rois += 1
-
-        # Convert energy to eV
-        if energy[int((len(energy) - 1) / 2)] < 1e3:
-            energy = np.array(energy) * 1e3
-        if incident_energy < 1e3:
-            incident_energy *= 1e3
-
-        # Get energy step size
-        en_step = np.mean(np.diff(energy), dtype=int)
-
-        # Only try to find rois if the max_roi_num is not satisfied by specific_elements inputs
-        if num_interesting_rois < max_roi_num:
-            # Do not modify the original data
-            xrf = xrf.copy()
-
-            # Crop XRF and energy to reasonable limits (Assuming 10 eV steps)
-            # No peaks below 1000 eV or above 85% of incident energy
-            en_range = slice(int(1e3 / en_step), int(0.9 * incident_energy / en_step))
-            xrf = xrf[en_range]
-            energy = energy[en_range]
-
-            # Remove invalid data_points (mostly zeros)
-            xrf[xrf < 1] = 1
-
-            # Estimate background and noise
-            bkg = mode(xrf)[0] * (200 / en_step)
-            noise = np.sqrt(bkg)
-
-            # Find peaks based on log prominence
-            peaks, proms = find_peaks(np.log(xrf), prominence=log_prominence)
-
-            # Blindly find intensity from 200 eV window (assuming 10 eV steps)
-            peak_snr = [(np.sum(xrf[peak - int(100 / en_step) : peak + int(100 / en_step)]) - bkg) / noise for peak in peaks]
-
-            # Sort the peaks by snr
-            sorted_peaks = [x for y, x in sorted(zip(peak_snr, peaks), key=lambda pair: pair[0], reverse=True)]
-            sorted_snr = sorted(peak_snr, reverse=True)
-
-            # Convert peaks to energies
-            peak_energies = [energy[peak] for peak in sorted_peaks]
-
-            # Identify peaks
-            peak_labels = []
-            for peak_ind, peak_en in enumerate(peak_energies):
-                
-                # Conditions to stop processing
-                if (num_interesting_rois == max_roi_num # reached max roi count
-                    or (sorted_snr[peak_ind] < snr_cutoff # peak snr is now below cutoff
-                        and num_interesting_rois >= min_roi_num)): # and enough rois have been identified
-                    break
-
-                PEAK_FOUND = False
-                # First, check if peak can be explained by an already identified element
-                for el in found_elements:
-                    if isinstance(el, int): # Unknown peak...
-                        continue
-
-                    for line in lines:
-                        line_en = el.emission_line[line] * 1e3
-                        # Direct peak
-                        if np.abs(peak_en - line_en) < energy_tolerance:
-                            PEAK_FOUND = True
-                            peak_labels.append(f'{el.sym}_{line}')
-                            break
-                    else:
-                        continue
-                    break
-                
-                # Second, check if peak is artifact of already identified peaks
-                # Check escape peaks first
-                if not PEAK_FOUND:
-                    for found_peak_en, found_peak_label in zip(peak_energies[:peak_ind], peak_labels):
-                        # Ignore escape peaks of other artifacts
-                        if found_peak_label.split('_')[-1] in ['escape', 'sum', 'double']:
-                            continue
-
-                        if np.abs(peak_en - (found_peak_en - esc_en)) < energy_tolerance * 2: # double for error propagation
-                            PEAK_FOUND = True
-                            peak_labels.append(f'{found_peak_label}_escape')
-                            break
-                
-                # Now check if it is a pile-up or sum peak
-                if not PEAK_FOUND:
-                    for comb_ind in combinations_with_replacement(range(peak_ind), r=2): # not considering combinations above two peaks
-                        sum_en = sum([peak_energies[ind] for ind in comb_ind])
-
-                        # Kick out any combinations of other artifacts
-                        if any([peak_labels[ind].split('_')[-1] in ['escape', 'sum', 'double'] for ind in comb_ind]):
-                            continue
-                        
-                        if comb_ind[0] != comb_ind[1]:
-                            comb_label = f'{peak_labels[comb_ind[0]]}_{peak_labels[comb_ind[1]]}_sum'
-                        else:
-                            comb_label = f'{peak_labels[comb_ind[0]]}_double'
-                        
-                        if np.abs(peak_en - sum_en) < energy_tolerance * 2: # double for error propagation
-                            PEAK_FOUND = True
-                            peak_labels.append(comb_label)
-                            break
-
-                # Otherwise check other elements based on strongest fluorescence
-                if not PEAK_FOUND:
-                    for line in major_lines: # Major lines should always be present if elements exists
-                        for el in elements:
-                            line_en = el.emission_line[line] * 1e3
-                            if np.abs(peak_en - line_en) < energy_tolerance:
-                                PEAK_FOUND = True
-                                found_elements.append(el)
-                                peak_labels.append(f'{el.sym}_{line}')
-                                if el.sym not in boring_elements:
-                                    num_interesting_rois += 1
-                                break
-                        else:
-                            continue
-                        break
-                    else: # Unlikely
-                        found_elements.append(int(peak_en))
-                        peak_labels.append('Unknown')
-                        num_interesting_rois += 1
-
-        # Generate new ROIS
-        rois, roi_labels = [], []
-        for el in found_elements:
-            # Add specified lines first
-            if isinstance(el, xrfC.XrfElement):
-                if el.sym in [line.split('_')[0] for line in specific_lines]:
-                    line = specific_lines[[line.split('_')[0] for line in specific_lines].index(el.sym)].split('_')[-1]
-                    line_en = el.emission_line[line] * 1e3
-                    rois.append(slice(int((line_en / en_step) - (100 / en_step)), int((line_en / en_step) + (100 / en_step))))
-                    roi_labels.append(f'{el.sym}_{line}')
-                    if verbose:
-                        print(f'Specified element ({el.sym}) with line ({line}) added.')
-                    continue
-                
-                # Ignore argon mostly
-                elif el.sym in boring_elements:
-                    if verbose:
-                        print(f'Found element {el.sym}, but it is too boring to generate ROI!') 
-                    continue            
-
-            elif isinstance(el, int):
-                if verbose:
-                    print(f'Found unknown ROI around {el} eV.')
-                rois.append(slice(int((el / en_step) - (100 / en_step)), int((el / en_step) + (100 / en_step))))
-                roi_labels.append('Unknown')
-                continue
-            
-            # Something bad happened
-            else:
-                print('WARNING: Weird element found in XRF ROIs. Moving on, but something is very wrong.')
-            
-
-            if verbose:
-                print(f'Found element {el.sym}! Generating ROI around highest yield fluorescence line.')    
-            # Slice major lines
-            for line in roi_lines:
-                line_en = el.emission_line[line] * 1e3
-                if 1e3 < line_en < incident_energy:
-                    if verbose:
-                        print(f'Highest yield fluorescence line for {el.sym} is {line}.')
-                    rois.append(slice(int((line_en / en_step) - (100 / en_step)), int((line_en / en_step) + (100 / en_step))))
-                    roi_labels.append(f'{el.sym}_{line}')
-                    break
-            else:
-                if verbose:
-                    print(f'No fluorescence line found for {el.sym} with an incident energy of {incident_energy} eV!')
-                    print(f'Cannot generate ROI for {el.sym}!')
-
-        return rois, roi_labels
+from .find_xrf_rois import find_xrf_rois
 
 
 class SRXScanPDF(FPDF):
@@ -453,7 +173,7 @@ class SRXScanPDF(FPDF):
                 raise ValueError('Must define space_needed or num_images!')
             space_needed = (self._banner_height
                             + self._gap_height
-                            + self._offset_height
+                            # + self._offset_height # I think gap_height covers this one.
                             + ((self._max_height + self._offset_height) * np.ceil(1 + (num_images - 1) / 3))) # a touch awful...
         
         if self._verbose:
@@ -829,17 +549,20 @@ class SRXScanPDF(FPDF):
                 sclr_keys = [f'sclr_{key}' for key in sclr_keys]
             
             for sclr_key in sclr_keys:
-                if not np.all(bs_run[stream]['data'][sclr_key][:] <= 0):
-                    if scan_type == 'fly':
-                        sclr = bs_run[stream]['data'][sclr_key][:].astype(np.float32)
-                    else:
-                        sclr = self._load_and_reshape_step_data(bs_run, sclr_key)
-                    sclr[sclr < 1] = np.mean(sclr[sclr >= 1]) # Handles zeros
-                    break
+                try:
+                    if not np.all(bs_run[stream]['data'][sclr_key][:] <= 0):
+                        if scan_type == 'fly':
+                            sclr = bs_run[stream]['data'][sclr_key][:].astype(np.float32)
+                        else:
+                            sclr = self._load_and_reshape_step_data(bs_run, sclr_key)
+                        sclr[sclr < 1] = np.mean(sclr[sclr >= 1]) # Handles zeros
+                        break
+                except Exception as e:
+                    print(f"WARNING: Error loading data for scaler {sclr_key}:\n\t{e}\nTrying another scaler key...")
             else:
                 warn_str = (f"WARNING: Issue encountered with scaler "
                             + f"for scan {bs_run.start['scan_id']}. "
-                            + "Proceeding with unormalized data.")
+                            + "Proceeding with unnormalized data.")
                 print(warn_str)
                 sclr = np.ones(bs_run[stream]['data'][sclr_key].shape)
 
@@ -869,14 +592,20 @@ class SRXScanPDF(FPDF):
             if 'merlin' in roi_dets:
                 rois.append('merlin')
                 roi_labels.append('merlin')
+            if 'eiger' in roi_dets:
+                rois.append('eiger')
+                roi_labels.append('eiger')
             # Add xs rois
             if ('xs' in roi_dets
                 and len(rois) < max_roi_num):
                 # Grab user-determined roi_information
                 if isinstance(scan['detectors'], dict):
                     xs_det_rois = scan['detectors']['xs']
-                    xs_rois = [xs_det_rois[f'roi{ind + 1}'] for ind in range(len(xs_det_rois))]
-                    xs_rois = [roi for roi in xs_rois if roi != '']
+                    xs_rois = []
+                    for ind in range(len(xs_det_rois)):
+                        xs_roi = xs_det_rois[f'roi{ind + 1}']
+                        if xs_roi != '' and xs_roi not in xs_rois:
+                            xs_rois.append(xs_roi)
 
                     if 'specific_elements' in scan_kwargs:
                         scan_kwargs['specific_elements'] = xs_rois + scan_kwargs['specific_elements']
@@ -899,13 +628,13 @@ class SRXScanPDF(FPDF):
                 energy = np.arange(0, len(xrf_sum)) * 10                
 
                 # Identify peaks and determine ROIS
-                (xs_rois, xs_roi_labels) = _find_xrf_rois(xrf_sum,
-                                                          energy,
-                                                          scan_data['energy'],
-                                                          min_roi_num=min_roi_num,
-                                                          max_roi_num=max_roi_num,
-                                                          scan_kwargs=scan_kwargs,
-                                                          verbose=self._verbose)
+                (xs_rois, xs_roi_labels) = find_xrf_rois(xrf_sum,
+                                                         energy,
+                                                         scan_data['energy'],
+                                                         min_roi_num=min_roi_num,
+                                                         max_roi_num=max_roi_num,
+                                                         scan_kwargs=scan_kwargs,
+                                                         verbose=self._verbose)
                 # This can extend rois beyond the max_roi_num
                 rois.extend(xs_rois)
                 roi_labels.extend(xs_roi_labels)
@@ -946,30 +675,33 @@ class SRXScanPDF(FPDF):
             else:
                 TRANSPOSED = False
             
-            # Determine image sizes
-            
             # Iterate through rois
-            for roi, roi_label in zip(rois, roi_labels):
-                if len(images) > max_roi_num:
+            for ind, (roi, roi_label) in enumerate(zip(rois,
+                                                       roi_labels)):
+                if len(images) >= max_roi_num:
                     break
+                if self._verbose:
+                    print(f'Generating figure for roi {ind}: {roi_label}')
                 
                 plot_func = None
                 if len(rois) == 1:
                     # Single image can be a little bigger
                     roi_max_width = self._max_plot_width
                 else:
-                    roi_max_width = np.min([self._max_plot_width, self.epw / 3])
+                    roi_max_width = np.min([self._max_plot_width,
+                                            (self.epw / 3) - (self._gap_width / 2)
+                                            ])
 
                 # VLM
                 if roi in ['vlm']:
                     fig = self._get_vlm_plot(bs_run,
-                                            max_width=self._max_plot_width)
+                                             max_width=self._max_plot_width)
                     roi_max_width = self._max_plot_width # Only one that is bigger...
                 # XRF
                 elif isinstance(roi, slice):
                     plot_func = lambda *a, **k : self._get_xrf_map_plot(*a, energy=energy, **k)
                 # XRD or DPC
-                elif roi in ['merlin', 'dexela']:
+                elif roi in ['merlin', 'dexela', 'eiger']:
                     plot_func = lambda *a, **k : self._get_ad_map_plot(*a, **k)
                 # Scaler or XBIC
                 elif roi in [str(s).lower() for s in scaler_rois]:
@@ -1157,13 +889,6 @@ class SRXScanPDF(FPDF):
             en_step = 10 # Hard-coded for now
 
             # XAS      
-            # if 'roi_names' in scan:
-            #     roi_label = scan['roi_names'][int(scan['roi_num']) - 1]
-            # elif ('detectors' in scan
-            #       and isinstance(scan['detectors'], dict)):
-            #     roi_label = scan['detectors']['xs']['roi1']
-            # else:
-            #     roi_label = 'Unknown'
             roi_label = None
             if 'roi_names' in scan:
                 roi_labels = scan['roi_names']
@@ -1182,12 +907,15 @@ class SRXScanPDF(FPDF):
                 # Use first specified label with edge in energy range
                 for label in roi_labels:
                     el, line = label.split('_')
-                    for edge_name in red_edges_names:
+                    for edge, edge_name in zip(red_edges, red_edges_names):
                         if el == edge_name.split('_')[0]:
                             roi_label = edge_name
                             line_en = xrfC.XrfElement(el).emission_line[line] * 1e3
                             roi = slice(int((line_en / en_step) - (100 / en_step)),
                                         int((line_en / en_step) + (100 / en_step)))
+                            # Reduce edges for consistency
+                            red_edges_names = [edge_name]
+                            red_edges = [edge]
                             break
                     else:
                         continue
@@ -1195,23 +923,27 @@ class SRXScanPDF(FPDF):
                 # Otherwise pull from XRF
                 else:
                     if self._verbose:
-                        print('Cannot find XAS ROI in scan metadata. Guessing for XRF spectrum.')
+                        print('Cannot find XAS ROI in scan metadata. Guessing from XRF spectrum.')
                     if (scan_type == 'fly' and any(['scan' in key for key in bs_run.keys()])):
                         stream_names = [key for key in bs_run.keys() if 'scan' in key]
-                        xrf_sum = np.sum([bs_run[stream_names[0]]['data'][f'xs_id_mono_fly_channel0{ind + 1}'][..., :2500] for ind in range(7)], axis=(0, 1))
+                        xrf_sum = np.sum([bs_run[stream_names[0]]['data'][f'xs_id_mono_fly_channel0{ind + 1}'][..., :2500] for ind in range(7)], axis=(0, 1, 2))
                     else:
-                        xrf_sum = np.sum([bs_run['primary']['data'][f'xs_channel0{i + 1}_fluor'][..., :2500] for i in range(7)], axis=(0, 1))
+                        xrf_sum = np.sum([bs_run['primary']['data'][f'xs_channel0{i + 1}_fluor'][..., :2500] for i in range(7)], axis=(0, 1, 2))
                     
-                    xs_roi = _find_xrf_rois(xrf_sum,
-                                            np.arange(0, len(xrf_sum)) * en_step,
-                                            en_end)
+                    xs_roi = find_xrf_rois(xrf_sum,
+                                           np.arange(0, len(xrf_sum)) * en_step,
+                                           en_end)
                     
                     for roi, roi_label in zip(*xs_roi):
                         el, line = roi_label.split('_')
-                        for edge_name in red_edges_names:
-                            if el == edge_name.split('_'):
+                        for edge, edge_name in zip(red_edges, red_edges_names):
+                            if el == edge_name.split('_')[0]:
+                                # Reduce edges for consistency
+                                red_edges_names = [edge_name]
+                                red_edges = [edge]
                                 break
                     # Give up
+                    # TODO reduce edge names to best option
                     else:
                         if self._verbose:
                             print('Failed to find ROI from XRF spectrum. ROI fitting will be bad.')
@@ -1228,21 +960,6 @@ class SRXScanPDF(FPDF):
                             # No idea, try everything...
                             roi_label = 'Total XRF'
                             roi = slice(20, 2500)
-
-            # if roi_label != 'Unknown':
-            #     el, line = roi_label.split('_')
-            #     line_en = xrfC.XrfElement(el).emission_line[line] * 1e3
-            #     en_step = 10 # Hard-coded for now
-            #     roi = slice(int((line_en / en_step) - (100 / en_step)),
-            #                 int((line_en / en_step) + (100 / en_step)))
-
-            #     # Reduce possible edges...
-            #     red_edges_mask = [el in name for name in all_edges_names]
-            #     red_edges_names = [name for b, name in zip(red_edges_mask, all_edges_names) if b]
-            #     red_edges = [edge for b, edge in zip(red_edges_mask, all_edges) if b]
-            # else:
-            #     red_edges_names = all_edges_names.copy()
-            #     red_edges = all_edges.copy()
 
             # Load data
             # TODO: Allow for multiple edges with XAS_FLY?
@@ -1270,10 +987,10 @@ class SRXScanPDF(FPDF):
                     stream_names = [key for key in bs_run.keys() if 'scan' in key]
                     en, data, marker, labels = [], [], [], []
                     for name in stream_names:
-                        en_i = bs_run[name]['data']['energy'][:].astype(float)
+                        en_i = bs_run[name]['data']['energy'][0].astype(float)
                         data_i = np.sum([bs_run[name]['data'][f'xs_id_mono_fly_channel0{ind + 1}'][..., roi]
-                                         for ind in range(7)], axis=(0, -1)).astype(float)
-                        data_i /= bs_run[name]['data']['i0'][:].astype(float)
+                                         for ind in range(7)], axis=(0, -1))[0].astype(float).squeeze()
+                        data_i /= bs_run[name]['data']['i0'][0].astype(float)
                         edge_ind = np.argmax(np.gradient(data_i, en_i))
                         el_edge = red_edges_names[np.argmin(np.abs(np.array(red_edges) - en_i[edge_ind]))]
                         marker.append((en_i[edge_ind], data_i[edge_ind]))
@@ -1517,7 +1234,7 @@ class SRXScanPDF(FPDF):
         input_str = f"{scan_inputs[0]}, {scan_inputs[1]}"
         all_dets = [det for det in scan['detectors']]
         useful_dets = [det for det in all_dets if det not in ['nano_vlm', 'ring_current']]
-        roi_dets = [det for det in useful_dets if det in ['merlin', 'dexela']]
+        roi_dets = [det for det in useful_dets if det in ['merlin', 'dexela', 'eiger']]
         table_values = [input_str,
                         f"{scan_inputs[0]}",
                         f"{scan['dwell']} sec",
@@ -1696,6 +1413,9 @@ class SRXScanPDF(FPDF):
         en_int = energy[roi]
         roi_str = f"{roi_label}: {int(en_int[0])} - {int(en_int[-1])} eV"
 
+        if self._verbose:
+            print(f'{roi_label} has mean: {np.mean(data):.4f} and standard deviation: {np.std(data):.4f}')
+
         fig = self._get_mapped_plot(bs_run,
                                     scan_args,
                                     data,
@@ -1810,6 +1530,8 @@ class SRXScanPDF(FPDF):
         else:
             # Fly in y, transponsed data
             if transposed:
+                if self._verbose:
+                    print('Transposing map...')
                 data = data.T
                 start_shape = start_shape[::-1]
                 # Is the data complete?
@@ -1829,9 +1551,18 @@ class SRXScanPDF(FPDF):
                     data = full_data
         
         # Generate plot
+        # figscale = 0.25
+        # pad = 5 # in mm
+        # figsize = np.array([(max_width + pad) / 25.4,
+        #                     (max_height + pad) / 25.4]) / figscale
+        # fig, ax = plt.subplots(figsize=figsize, layout=None, dpi=200)
+        # fontsize = 36
         figsize = [max_width / 15, max_height / 15]
         fig, ax = plt.subplots(figsize=figsize, layout='tight', dpi=200)
         fontsize = 12
+
+        # fig.patch.set_linewidth(2)
+        # fig.patch.set_edgecolor('cornflowerblue')
 
         exts = [scan_args[1] - scan_args[0], scan_args[4] - scan_args[3]]
         if bs_run.start['scan']['type'].split('_')[-1].lower() == 'fly':
@@ -1849,17 +1580,18 @@ class SRXScanPDF(FPDF):
             else:
                 ax.scatter(scan_args[0], data.squeeze()) # Not a very good map...
             ax.ticklabel_format(axis='y', style='sci', scilimits=(-2, 2))
+            ax.yaxis.get_offset_text().set_size(fontsize)
             ax.set_ylabel(int_label, fontsize=fontsize)
         else: # Plot image
             extent = [scan_args[0] - steps[0] / 2,
                       scan_args[1] + steps[0] / 2,
                       scan_args[4] + steps[1] / 2,
                       scan_args[3] - steps[1] / 2]
-            clims = [np.min(data), np.max(data)]
+            clims = [np.nanmin(data), np.nanmax(data)]
 
             # Change colorscale
             if colornorm == 'log':
-                log_min = 1 / np.max(sclr)
+                log_min = 1 / np.nanmax(data)
                 if 'dexela' in title:
                     log_min *= 1e2
                 data[data <= 0] = log_min
@@ -1872,11 +1604,13 @@ class SRXScanPDF(FPDF):
             if colornorm == 'linear':
                 cbar.formatter.set_powerlimits((-2, 2))
             cbar.ax.tick_params(labelsize=fontsize)
+            cbar.ax.yaxis.get_offset_text().set_fontsize(fontsize)
+            ax.yaxis.get_offset_text().set_size(fontsize)
             ax.set_aspect('equal')
             ax.set_ylabel(y_label, fontsize=fontsize)
         ax.tick_params(axis='both', labelsize=fontsize)
         ax.set_xlabel(x_label, fontsize=fontsize)
-        ax.set_title(title, fontsize=fontsize, pad=15)
+        ax.set_title(title, fontsize=fontsize, pad=fontsize + 3)
         
         return fig
 
@@ -2153,6 +1887,10 @@ class SRXScanPDF(FPDF):
             exp_md['title'] = start['proposal']['proposal_title']
         else:
             exp_md['title'] = 'TITLE MISSING'
+        # PDF default Helvetica font cannot handle beyond latin1
+        exp_md['title'] = exp_md['title'].encode(
+                                        'latin1',
+                                        'backslashreplace').decode()
         
         # pi_name
         if 'pi_name' in start['proposal']:
@@ -2311,439 +2049,3 @@ class SRXScanPDF(FPDF):
                 scan_base_data[att] = None
 
         return scan_base_data
-
-
-def generate_scan_report(start_id=None,
-                         end_id=None,
-                         proposal_id=None,
-                         cycle=None,
-                         wd=None,
-                         continuous=True,
-                         verbose=False,
-                         **kwargs):
-    
-    """
-    Function for generating an SRX scan report.
-
-    Function for generating an SRX scan report based on information
-    provided by the start_id, end_id, proposal_id, and cycle and the
-    continuous flag. Several combinations exists dictating different
-    behavior depending on which parameters are provided:
-
-    - If the start_id is provided and end_id is not, then every scan
-      will be added to the report within the proposal scope of the
-      start_id. If the continuous flag is False, the report will stop
-      after the first change in the proposal scope.
-    - If both the start_id and end_id are provided, then every scan
-      between the two will be appended to the report, if the scan
-      matchesthe proposal scope of the start_id.
-    - If the start_id is not provided and proposal_id and cycle are,
-      then the first scan ID matching the proposal scope will be used
-      as the start_id. If the most recent scan ID falls outside the
-      proposal scope and scans already exist within the proposal scope,
-      then the last scan within the proposal scope will be set as the
-      end_id, and the continuous flag will be set to True. The
-      combinations of these two definitions are defined as above.
-    - The continuous flag dictates how breaks in the proposal scope are
-      handled. If False, then report generation will be paused when a
-      scan ID is encountered that leaves the proposal scope. This
-      really only affects the first bullet in this list.
-    - If neither the start_id or proposal_id and cycle are provided, a
-      ValueError will be raised based on insufficient information to
-      begin the scan report.
-
-    Scan report generation will initiate a loop that will continuously
-    monitor scan completion and append finished scans. At any time
-    during this loop, a KeyboardInterrupt will pause the report
-    generation. Waiting 10 seconds after the KeyboardInterrupt will
-    leave the report in a paused state, which can be resumed by
-    running the function again with the same start_id, end_id,
-    proposal_id, and cycle parameters. If another KeyboardInterrupt
-    is entered within this 10 sec window, the report will be finalized
-    and new scans can no longer be appended.
-
-
-    Parameters
-    ----------
-    start_id : int, optional
-        Scan ID of first scan included in the scan report. If this scan
-        ID exists in the database, the proposal ID and cycle
-        information will be taken for this scan ID. If this parameter
-        is None, then the first scan ID matching the proposal ID and
-        cycle will be used instead.
-    end_id : int, optional
-        Scan ID of the last scan included in the scan report. If this
-        parameter is provided, report generation will continue from the
-        start ID until the end ID.
-    proposal_id : int, optional
-        The ID of the proposal used with the cycle to determine the
-        proposal scope. If None, the proposal_id will be set base on
-        the start_id scan. 
-    cycle : str, optional
-        The cycle of the proposal used with the proposal_id to
-        determine the proposal scope. If None, the cycle will be set
-        based on the start_id scan.
-    continuous : bool, optional
-        This flag dicates how breaks in the proposal scope are handled.
-        If False, then report generation will be paused when a scan ID
-        leaves the proposal scope. If True, scan IDs outside the
-        proposal scope will be skipped and scan IDs that re-enter the
-        proposal scope will be appended. This only affects behavior
-        when the start_id is specified and the end_id is None.
-    wd : path, optional
-        Path to write the scan_report. If None, a path will be built
-        from the proposal_id and cycle if provided, or from the
-        same information determined from the start_id. If 'scan_report'
-        is not within the wd or one of its sub-directories, a new
-        'scan_reports' will be created within wd.
-    verbose : bool, optional
-        Flag to determine the verbosity. False by default.
-    kwargs : dict, optional
-        Keyword argmuents passed to the 'add_scan' function and other
-        functions that are called within.
-
-        add_scan
-        --------
-            include_optimizers : bool, optional
-                Flag to include PEAKUP and OPTIMIZE_SCALERS functions
-                in the scan report. True by default.
-            include_unknowns : bool, optional
-                Flag to include unknown scan types in the scan report.
-                True by default.
-            include_failures : bool, optional
-                Flag to include failed and aborted scans in the scan
-                report. True by default.
-
-        add_XRF_FLY
-        -----------
-            min_roi_num : int, optional
-                Minimum number of rois to try and include for fly scan
-                plots. Should not go below 1 or exceed max_roi_num.
-                This parameter cannot force plotting of elements that
-                do not exist and may not currently do anything.
-            max_roi_num : int, optional
-                Maximmum number of rois to try and include for fly scan
-                plots. Should not exceed 10 and works well for 1, 4, 7,
-                and 10. By default this value is 10.
-            scaler_rois : list, optional
-                List of scaler names to include in the fly scan plots.
-                Accepts 'i0', 'im', and 'it', by will include none by
-                default.
-            ignore_det_rois : list, optional
-                List of detectors names as strings to be ignored for
-                fly scan plotting. Can include 'merlin' or 'dexela'
-                and by default will include neither.
-            colornorm : str, optional
-                Color normalization passed to matplotlib.axes.imshow.
-                Can be 'linear', or 'log'. 'linear' by default.
-
-        _find_xrf_rois
-        --------------
-            specific_elements : list, optional
-                List of element abbreviations as strings which will be
-                guaranteed inclusion in the report. Theses elements
-                will appear in the order given. By default, no elements
-                will be guaraneteed.
-            log_prominence : float, optional
-                The prominence value passed to scipy.signal.find_peaks
-                function of the log of the integrated XRF spectra.
-            energy_tolerance : float, optional
-                Energy window used for peak assignment of identified
-                peaks. 50 eV by default.
-            esc_en : float, optional
-                Escape energy in eV. Used to allow for escape peak
-                assignment. 1740 (for Si detectors) by default.
-            snr_cutoff : float, optional
-                Signal-to-noise ratio cutoff value. Use to determine
-                the cutoff value for thresholding peak significance.
-
-
-    Raises
-    ------
-    ValueError if insufficient information is provided to determine the
-        report write location, or if the start_id is greater than the
-        end_id.
-    TypeError if key in kwargs is not expected.
-    
-    Examples
-    --------
-    After loading this file.
-
-    >>> generate_scan_report(12345, continuous=False, max_roi_num=4,
-    ... specific_elements=['Fe', 'Cr', 'Ni'])
-
-    This will start generating a report starting with scan ID 12345 and
-    will continue until the scans leave the proposal scope of this scan
-    ID or until a KeyboardInterrupt is given. This scan report will
-    plot up to 4 regions of interest for each XRF_FLY scan and will try
-    to include 'Fe', 'Cr', and 'Ni' first in that order. If no area
-    detectors are included, the report will try to include another
-    element to fill the 4 regions of interest, but this may not succeed
-    depending on the XRF signal.
-    """
-
-    # Quick function to get keyword argument names
-    get_kwargs = lambda func : func.__code__.co_varnames[func.__code__.co_argcount - len(func.__defaults__) : func.__code__.co_argcount]
-
-    # Parse kwargs to make sure they are useful. Add functions and methods as necessary
-    useful_kwargs = (list(get_kwargs(SRXScanPDF.add_scan))
-                     + list(get_kwargs(SRXScanPDF._add_xrf_general))
-                     + list(get_kwargs(_find_xrf_rois)))
-    useful_kwargs.remove('scan_kwargs')
-    for key in kwargs.keys():
-        if key not in useful_kwargs:
-            err_str = f"generate_scan_report got an unexpected keyword argument '{key}'"
-            raise TypeError(err_str)
-    
-    # Parse requested inputs
-    # Get data from start id first
-    if start_id is not None:
-        if start_id == -1:
-            start_id = int(c[-1].start['scan_id'])
-        else:
-            start_id = int(start_id)
-
-        if start_id in c:
-            start_cycle = c[start_id].start['cycle']
-            if 'proposal_id' in c[start_id].start['proposal']:
-                start_proposal_id = c[start_id].start['proposal']['proposal_id']
-            elif 'proposal_num' in c[start_id].start['proposal']:
-                start_proposal_id = c[start_id].start['proposal']['proposal_num']
-            else:
-                err_str = f'Cannot find proposal identification key from start document!'
-                raise ValueError(err_str)
-
-            if ((proposal_id is not None and proposal_id != start_proposal_id)
-                or (cycle is not None and cycle != start_cycle)):
-                warn_str = (f'WARNING: Starting scan ID of {start_id} '
-                            + f'has proposal ID ({start_proposal_id}) '
-                            + f'and cycle ({start_cycle}) which does '
-                            + f'not match the provided proposal ID '
-                            + f'({proposal_ID}) and cycle ({cycle})!'
-                            + f'\nUsing the start ID {start_id} '
-                            + 'information.')
-                print(warn_str)
-                proposal_id = start_proposal_id
-                cycle = start_cycle
-            else:
-                proposal_id = start_proposal_id
-                cycle = start_cycle
-            
-            if wd is None:
-                wd = f'/nsls2/data3/srx/proposals/{cycle}/pass-{proposal_id}'
-        
-        else:
-            if wd is None:
-                err_str = ('Cannot determine write location. Please '
-                           + 'provide start_id of previous scan or '
-                           + 'cycle and proposal_id.')
-                raise ValueError(err_str)               
-
-    # Default to proposal information next. This may be more popular
-    elif proposal_id is not None and cycle is not None:
-        if wd is None:
-            wd = f'/nsls2/data3/srx/proposals/{cycle}/pass-{proposal_id}'
-        lim_c = c.search(Key('cycle') == str(cycle)).search(Key('proposal.proposal_id') == str(proposal_id))
-        if len(lim_c) > 0:
-            start_id = int(lim_c[0].start['scan_id'])
-            if end_id is None: # Attempt to see if the proposal is already finished
-                last_id = int(c[-1].start['scan_id'])
-                end_id = int(lim_c[-1].start['scan_id'])
-                if last_id == end_id:
-                    end_id = None
-                continuous = True
-        else:
-            # Hoping the next scan will be correct
-            start_id = int(c[-1].start['scan_id']) + 1
-    
-    else:
-        err_str = ('Cannot determine write location. Please provide'
-                   + ' start_id of previous scan or cycle and '
-                   + 'proposal_id.')
-        raise ValueError(err_str)
-    
-    # Pre-populate proposal information
-    exp_md = {'proposal_id' : proposal_id,
-              'cycle' : cycle}
-  
-    if end_id is not None and end_id < 0:
-        end_id = int(c[int(end_id)].start['scan_id'])
-        continuous = True
-    elif end_id is not None:
-        end_id = int(end_id)
-        if end_id < start_id:
-            err_str = (f'end_id ({end_id}) of must be greater than or '
-                       + f'equal to start_id ({start_id}).')
-            raise ValueError(err_str)
-    current_id = start_id # Create current_id as counter
-
-    if verbose:
-        print(f'Final end_id is {end_id}')
-    
-    # Setup file paths
-    if 'scan_report' not in wd: # Lacking the 's' for generizability
-        directories = [x.path for x in os.scandir(wd) if x.is_dir()]
-        for d in directories:
-            if 'scan_report' in d:
-                wd = os.path.join(wd, d)
-                break
-        else:
-            wd = os.path.join(wd, 'scan_reports')
-    os.makedirs(wd, exist_ok=True)
-
-    # Setup filename and exact paths
-    filename = f'scan{start_id}-{end_id}_report'
-    pdf_path = os.path.join(wd, f'{filename}.pdf')
-    md_path = os.path.join(wd, f'{filename}_temp_md.json')
-
-    # Read pdf and md if exists
-    current_pdf = None
-    pdf_md = None
-    # Only append to reports if the temp_md.json file also exists
-    if os.path.exists(pdf_path) and os.path.exists(md_path):
-        current_pdf = PdfReader(pdf_path)
-        with open(md_path) as f:
-            pdf_md = json.load(f)
-        current_id = pdf_md['current_id'] + 1 # This off-by one may be wrong...
-    
-    if verbose:
-        print(f'PDF path is: {pdf_path}')
-    
-    # Move to continuous writing
-    while True:
-        try:
-            # First check if the scan report has finished
-            if end_id is not None and current_id > end_id:
-                os.remove(md_path)
-                print(f'Finishing scan report...')
-                break
-            
-            # Second check to see if the current_id is finished
-            WAIT = False
-            recent_id = c[-1].start['scan_id']
-            # current_id has not been started
-            if current_id > recent_id: 
-                WAIT = True
-            elif current_id <= recent_id:
-                if current_id not in c:
-                    err_str = (f'Scan ID {current_id} not found in '
-                               + 'tiled. Currently no provisions for '
-                               + 'this error.\nSkipping and moving to '
-                               + 'next scan ID.')
-                    current_id += 1
-                    continue
-                # Has the current_id finished?
-                elif current_id == recent_id:
-                    if (not hasattr(c[current_id], 'stop')
-                        or c[current_id].stop is None
-                        or 'time' not in c[current_id].stop):
-                        WAIT = True
-            
-            # Current scan has yet to finish. Give it some time.
-            if WAIT:
-                print(f'Current scan ID {current_id} not yet finished. Waiting 5 minutes...')
-                ttime.sleep(300)
-                continue
-            
-            # Third check if the current_id is within the proposal
-            scan_report = SRXScanPDF(verbose=verbose)
-            scan_report.get_proposal_scan_data(current_id)
-            if all([scan_report.exp_md[key] == exp_md[key]
-                    for key in ['proposal_id', 'cycle']]):
-                exp_md = scan_report.exp_md
-            else:
-                note_str = (f'Current scan ID {current_id} not within '
-                           + f'Proposal # : {exp_md["proposal_id"]}.')
-                print(note_str)
-                # Continuously appending or waiting to initialize
-                if continuous or current_pdf is None:
-                    print(f'\tSkipping Scan {current_id}.')
-                    current_id += 1
-                    continue
-                # Already initialized, expectation is to be finished.
-                else:
-                    os.remove(md_path)
-                    print(f'Finishing scan report...')
-                    break                
-
-            # Final check performed on first successful current_id only
-            if current_pdf is None:
-                print(f'Initializing scan report...')
-                # Create first pdf page
-                scan_report.add_page()
-
-                # Update md
-                pdf_md = {'current_id' : current_id,
-                          'abscissa' : (scan_report.x, scan_report.y)}
-
-                # Write data
-                scan_report.output(pdf_path)
-                with open(md_path, 'w') as f:
-                    json.dump(pdf_md, f)
-
-                # Read data. # md already loaded
-                current_pdf = PdfReader(pdf_path)
-
-                # Regenerate scan report
-                scan_report = SRXScanPDF(verbose=verbose)
-                scan_report.exp_md = exp_md
-            
-            print(f'Adding scan {current_id}...')
-            scan_report._appended_pages = current_pdf.numPages - 1
-
-            # Add blank page for overlay
-            scan_report.add_page(disable_header=True)
-
-            # Set cursor location
-            scan_report.set_xy(*pdf_md['abscissa'])
-            # Add new scan
-            scan_report.add_scan(current_id, **kwargs)
-            # Update md
-            pdf_md = {'current_id' : current_id,
-                      'abscissa' : (scan_report.x, scan_report.y)}
-
-            # Overlay first page of new pdf to last page of previous
-            new_pdf = PdfReader(io.BytesIO(scan_report.output()))
-            current_pdf.pages[-1].merge_page(page2=new_pdf.pages[0])
-            
-            # Add these pages to the new writer
-            writer = PdfWriter()
-            writer.append_pages_from_reader(current_pdf)
-            # Add any newly generated pages
-            for i in range(1, new_pdf.numPages):
-                writer.add_page(new_pdf.pages[i])
-            # Overwrite pervious file with updated pdf
-            writer.write(pdf_path)
-
-            # Overwrite previous data
-            with open(md_path, 'w') as f:
-                json.dump(pdf_md, f)
-
-            # Re-read data to update current_pdf
-            # md is already updated
-            current_pdf = PdfReader(pdf_path)
-
-            # Update scan_id
-            current_id += 1
-
-        except KeyboardInterrupt:
-            try:
-                print('') # for the '^C'
-                print('KeyboardIterrupt triggered; report generation paused. Waiting 10 sec before exiting...')
-                print('Press ctrl+C again to finalize and cleanup report in its current state.')
-                ttime.sleep(10)
-                break
-            except KeyboardInterrupt:
-                # Cleanup files
-                print('') # for the '^C'
-                print(f'Report generation finalized on scan {current_id}. Cleaning up files in their current state...')
-                new_filename = f'scan{start_id}-{current_id - 1}_report'
-                new_pdf_path = os.path.join(wd, f'{new_filename}.pdf')
-                os.rename(pdf_path, new_pdf_path)
-                os.remove(md_path)
-                break
-        except Exception as e:
-            print(f'Error encountered for scan {current_id}. Pausing report generation.')
-            raise e
-
-    print('done!')
