@@ -2,6 +2,10 @@
 import numpy as np
 from scipy.signal import find_peaks
 import skbeam.core.constants.xrf as xrfC
+from itertools import combinations_with_replacement
+from scipy.stats import mode
+
+from . import c
 
 # Get elemental information
 possible_elements = ['Si', 'P', 'S', 'Cl', 'Ar', 'K', 'Ca', 'Sc', 'Ti', 'V',

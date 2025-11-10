@@ -2,13 +2,17 @@ import numpy as np
 import time as ttime
 import os
 import json
+import io
+
 
 from PyPDF2 import PdfReader, PdfWriter, PdfMerger
 
 from tiled.queries import Key
 from httpx import ReadTimeout
 
+from .find_xrf_rois import find_xrf_rois
 from .SRXScanPDF import SRXScanPDF
+from . import c
 
 
 def generate_scan_report(start_id=None,
@@ -186,7 +190,7 @@ def generate_scan_report(start_id=None,
     # Parse kwargs to make sure they are useful. Add functions and methods as necessary
     useful_kwargs = (list(get_kwargs(SRXScanPDF.add_scan))
                      + list(get_kwargs(SRXScanPDF._add_xrf_general))
-                     + list(get_kwargs(_find_xrf_rois)))
+                     + list(get_kwargs(find_xrf_rois)))
     useful_kwargs.remove('scan_kwargs')
     for key in kwargs.keys():
         if key not in useful_kwargs:

@@ -1,6 +1,7 @@
 import numpy as np
 import time as ttime
 import dask.array as da
+import os
 
 from fpdf import FPDF
 
@@ -14,7 +15,13 @@ from matplotlib_scalebar.scalebar import ScaleBar
 from PIL import Image
 from scipy.ndimage import median_filter
 
+from xrdmaptools.io.db_io import (
+    manual_load_data,
+    load_step_rc_data
+)
+
 from .find_xrf_rois import find_xrf_rois
+from . import c
 
 
 class SRXScanPDF(FPDF):
@@ -72,7 +79,10 @@ class SRXScanPDF(FPDF):
 
         self.set_font(size=11)
 
-        self.image('/nsls2/users/emusterma/Documents/Repositories/srx-scan-reports/data/srx_logo.png', h=15, keep_aspect_ratio=True)
+        filepath = os.path.dirname(os.path.dirname(__file__))
+        filepath = os.path.join(filepath, 'data/srx_logo.png')
+        # self.image('/nsls2/users/emusterma/Documents/Repositories/srx_scan_reports/data/srx_logo.png', h=15, keep_aspect_ratio=True)
+        self.image(filepath, h=15, keep_aspect_ratio=True)
         self.set_xy(self.l_margin, self.t_margin)
 
         with self.table(
